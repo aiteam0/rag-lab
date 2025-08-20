@@ -1,0 +1,127 @@
+{
+  "planning": {
+    "subtasks": [
+      {
+        "id": "0f1495f4-0734-4cd3-8067-62b9f095361d",
+        "query": "엔진 오일 교체 절차",
+        "priority": 1,
+        "dependencies": [],
+        "status": "executing",
+        "result": null,
+        "error": null,
+        "documents": [],
+        "answer": null,
+        "query_variations": [
+          "엔진 오일 교체 절차",
+          "How to replace engine oil",
+          "엔진 오일 교환 방법",
+          "Steps for changing motor oil"
+        ],
+        "extracted_info": {
+          "pages": [],
+          "categories": [],
+          "entity_type": null,
+          "source": null,
+          "keywords": [],
+          "requirements": ""
+        }
+      },
+      {
+        "id": "131659e8-161b-4361-ab99-a376d09bef34",
+        "query": "엔진 오일 종류 및 규격",
+        "priority": 2,
+        "dependencies": [
+          "엔진 오일 교체 절차"
+        ],
+        "status": "pending",
+        "result": null,
+        "error": null,
+        "documents": [],
+        "answer": null
+      }
+    ],
+    "current_subtask_idx": 0,
+    "metadata": {
+      "planning": {
+        "total_subtasks": 2,
+        "strategy": "Identify the procedure for changing engine oil and the types and specifications of engine oil required.",
+        "complexity": "moderate"
+      },
+      "subtask_0": {
+        "original_query": "엔진 오일 교체 절차",
+        "variations": [
+          "엔진 오일 교체 절차",
+          "How to replace engine oil",
+          "엔진 오일 교환 방법",
+          "Steps for changing motor oil"
+        ],
+        "filter_applied": null,
+        "available_categories": [
+          "caption",
+          "figure",
+          "header",
+          "heading1",
+          "list",
+          "paragraph",
+          "table"
+        ],
+        "available_entity_types": [
+          "image",
+          "table"
+        ]
+      },
+      "web_search_performed": true,
+      "web_search_results": 3
+    },
+    "workflow_status": "running"
+  },
+  "subtask_executor": {
+    "current_subtask_idx": 1
+  },
+  "retrieval": {
+    "error": "Retrieval failed: Query variations not found in state. SubtaskExecutor must run before Retrieval to generate query variations.",
+    "workflow_status": "failed",
+    "warnings": [
+      "Search error: Query variations not found in state. SubtaskExecutor must run before Retrieval to generate query variations."
+    ]
+  },
+  "web_search": {
+    "documents": [
+      "page_content='**엔진오일 교환주기와 셀프 교체하는 법! | 헤이딜러 블로그**\n\n우선, 엔진오일 주입구를 연 다음 차량 하부에 위치한 오일탱크를 찾아 오일 드레인을 그 아래에 위치시킵니다. 오일탱크의 볼트를 천천히 풀어준 뒤, 폐' metadata={'source': 'https://www.heydealer.com/blog/%EC%97%94%EC%A7%84%EC%98%A4%EC%9D%BC-%EA%B5%90%ED%99%98%EC%A3%BC%EA%B8%B0%EC%99%80-%EC%85%80%ED%94%84-%EA%B5%90%EC%B2%B4%ED%95%98%EB%8A%94-%EB%B2%95/', 'title': '엔진오일 교환주기와 셀프 교체하는 법! | 헤이딜러 블로그', 'score': 0.78944516, 'published_date': '', 'search_query': '엔진 오일 교체 절차', 'search_rank': 1, 'search_tool': 'tavily'}",
+      "page_content='**자동차 엔진 오일 교체 방법 (초보를 위한 자동차 기본 정비 상식)**\n\n가장 쉬운 엔진 오일 교체 방법 · 1000키로 또는 1년 주기가 되었는지 확인한다. · 가까운 정비소를 간다. · 사장님께 엔진 오일을 잘 교체해달라고 한다.' metadata={'source': 'https://prettyslowsanil.tistory.com/entry/%EC%9E%90%EB%8F%99%EC%B0%A8-%EC%97%94%EC%A7%84-%EC%98%A4%EC%9D%BC-%EA%B5%90%EC%B2%B4-%EB%B0%A9%EB%B2%95-%EC%B4%88%EB%B3%B4%EB%A5%BC-%EC%9C%84%ED%95%9C-%EC%9E%90%EB%8F%99%EC%B0%A8-%EA%B8%B0%EB%B3%B8-%EC%A0%95%EB%B9%84-%EC%83%81%EC%8B%9D', 'title': '자동차 엔진 오일 교체 방법 (초보를 위한 자동차 기본 정비 상식)', 'score': 0.7785319, 'published_date': '', 'search_query': '엔진 오일 교체 절차', 'search_rank': 2, 'search_tool': 'tavily'}",
+      "page_content='**자동차 엔진오일 교환방법 (그림설명) - 네이버 블로그**\n\n자동차 엔진오일 교환방법 6. 엔진 커버에 달리 오일 필러캡을 손으로 돌려서 열어줍니다. 오일 필러캐을 힘있게 반시계방향으로 돌려' metadata={'source': 'https://m.blog.naver.com/kakaokamall/220588714039', 'title': '자동차 엔진오일 교환방법 (그림설명) - 네이버 블로그', 'score': 0.7559439, 'published_date': '', 'search_query': '엔진 오일 교체 절차', 'search_rank': 3, 'search_tool': 'tavily'}"
+    ],
+    "metadata": {
+      "planning": {
+        "total_subtasks": 2,
+        "strategy": "Identify the procedure for changing engine oil and the types and specifications of engine oil required.",
+        "complexity": "moderate"
+      },
+      "subtask_0": {
+        "original_query": "엔진 오일 교체 절차",
+        "variations": [
+          "엔진 오일 교체 절차",
+          "How to replace engine oil",
+          "엔진 오일 교환 방법",
+          "Steps for changing motor oil"
+        ],
+        "filter_applied": null,
+        "available_categories": [
+          "caption",
+          "figure",
+          "header",
+          "heading1",
+          "list",
+          "paragraph",
+          "table"
+        ],
+        "available_entity_types": [
+          "image",
+          "table"
+        ]
+      },
+      "web_search_performed": true,
+      "web_search_results": 3
+    }
+  }
+}
