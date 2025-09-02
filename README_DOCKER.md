@@ -82,14 +82,13 @@ sudo service postgresql stop
 ### 3단계로 끝내기
 
 ```bash
-# 1. Docker 폴더로 이동
-cd /mnt/e/MyProject2/multimodal-rag-wsl-v2/docker
+# 1. 프로젝트 루트로 이동
+cd /mnt/e/MyProject2/multimodal-rag-wsl-v2
 
 # 2. Docker 컨테이너 시작
-docker-compose up -d
+docker-compose --env-file .env up -d
 
 # 3. 테이블 생성
-cd ..
 uv run scripts/1_phase1_setup_database.py
 ```
 
@@ -102,10 +101,10 @@ uv run scripts/1_phase1_setup_database.py
 ### Step 1: 프로젝트 구조 확인
 ```
 multimodal-rag-wsl-v2/
-├── docker/
-│   ├── docker-compose.yml    # Docker 설정 파일
-│   ├── init-db.sql           # 초기화 스크립트
-│   └── postgres-data/        # 데이터 저장 폴더 (자동 생성)
+├── docker-compose.yml        # Docker 설정 파일 (루트에 위치)
+├── db/
+│   └── init-db.sql          # 초기화 스크립트 (선택사항)
+├── docker/                   # Docker 관련 추가 파일
 ├── .env                      # 환경 설정 (수정 불필요!)
 └── scripts/                  # 데이터베이스 관리 스크립트
 ```
@@ -127,10 +126,10 @@ cat .env | grep DB_
 
 ### Step 3: Docker 컨테이너 시작
 ```bash
-cd docker
+# 프로젝트 루트에서 실행 (docker-compose.yml이 루트에 위치)
 
 # 백그라운드에서 시작 (-d 옵션)
-docker-compose up -d
+docker-compose --env-file .env up -d
 
 # 실행 확인
 docker ps
@@ -148,19 +147,22 @@ docker-compose logs postgres-rag
 # 정상 로그 예시:
 # postgres-rag | PostgreSQL init process complete; ready for start up.
 # postgres-rag | LOG: database system is ready to accept connections
+
+# 컨테이너 헬스체크 확인
+docker ps --format "table {{.Names}}\t{{.Status}}"
+# multimodal-rag-postgres    Up 2 minutes (healthy)
 ```
 
 ### Step 5: 연결 테스트
 ```bash
-# 프로젝트 루트로 이동
-cd ..
-
-# 연결 테스트
-uv run scripts/test_phase1_db_connection.py
+# 연결 테스트 (프로젝트 루트에서)
+uv run python test_docker_db.py
 
 # 성공 메시지:
-# ✅ Connected successfully!
-# ✅ Table exists!
+# ✅ Connected to Docker PostgreSQL
+# ✅ Database setup completed
+# ✅ pgvector extension version: 0.8.0
+# ✅ All tests passed successfully!
 ```
 
 ---
@@ -200,8 +202,8 @@ uv run scripts/test_phase1.py
 
 ### 시작하기
 ```bash
-# Docker 컨테이너 시작
-cd docker && docker-compose up -d
+# Docker 컨테이너 시작 (프로젝트 루트에서)
+docker-compose --env-file .env up -d
 
 # 상태 확인
 docker ps
@@ -210,7 +212,7 @@ docker ps
 ### 중지하기
 ```bash
 # 컨테이너 중지 (데이터 유지)
-cd docker && docker-compose stop
+docker-compose stop
 
 # 또는 down (데이터 유지)
 docker-compose down
@@ -235,6 +237,9 @@ docker-compose logs -f postgres-rag
 
 # 최근 100줄만 보기
 docker-compose logs --tail=100 postgres-rag
+
+# 컨테이너 리소스 사용량 확인
+docker stats multimodal-rag-postgres
 ```
 
 ### 데이터 백업
@@ -263,23 +268,29 @@ sudo lsof -i :5432
 # 로컬 PostgreSQL 중지
 sudo service postgresql stop
 
-# 또는 Docker 포트 변경 (docker-compose.yml)
+# 또는 Docker 포트 변경 (docker-compose.yml 수정)
 ports:
   - "5433:5432"  # 호스트 5433 -> 컨테이너 5432
+  
+# 환경변수에서 포트 변경 (.env 파일)
+DB_PORT=5433  # 애플리케이션이 사용할 포트
 ```
 
-### 문제 2: 권한 오류
+### 문제 2: 권한 오류 (WSL 환경)
 ```
-Error: permission denied for schema public
+Error: could not change permissions of directory
 ```
 
 **해결방법:**
 ```bash
-# 컨테이너 재시작
-docker-compose restart
-
-# init-db.sql이 실행되었는지 확인
-docker-compose logs postgres-rag | grep "pgvector extension"
+# Named Volume 사용 (이미 적용됨)
+# docker-compose.yml에서:
+volumes:
+  - postgres-data:/var/lib/postgresql/data  # Docker 관리 볼륨
+  
+# 기존 볼륨 제거 후 재생성
+docker-compose down -v
+docker-compose --env-file .env up -d
 ```
 
 ### 문제 3: 연결 실패
@@ -290,12 +301,15 @@ Error: could not connect to server
 **해결방법:**
 ```bash
 # 1. 컨테이너 실행 중인지 확인
-docker ps
+docker ps | grep multimodal-rag-postgres
 
-# 2. 컨테이너 시작
-cd docker && docker-compose up -d
+# 2. 컨테이너 시작 (프로젝트 루트에서)
+docker-compose --env-file .env up -d
 
-# 3. 방화벽 확인 (Windows)
+# 3. 헬스체크 상태 확인
+docker ps --format "table {{.Names}}\t{{.Status}}"
+
+# 4. 방화벽 확인 (Windows)
 # Windows Defender 방화벽에서 Docker Desktop 허용
 ```
 
@@ -333,7 +347,7 @@ processors=2
 **A:** 아니요. 둘 다 5432 포트를 사용하므로 하나만 실행해야 합니다.
 
 ### Q2: 데이터는 어디에 저장되나요?
-**A:** `docker/postgres-data/` 폴더에 저장됩니다. Docker를 삭제해도 이 폴더는 유지됩니다.
+**A:** Docker가 관리하는 Named Volume (`multimodal-rag-wsl-v2_postgres-data`)에 저장됩니다. WSL 환경의 권한 문제를 피하기 위해 Docker 관리 볼륨을 사용합니다.
 
 ### Q3: Docker 컨테이너를 완전히 제거하려면?
 ```bash
@@ -342,18 +356,19 @@ docker-compose down
 
 # 데이터까지 완전 삭제
 docker-compose down -v
-rm -rf docker/postgres-data/
+# 볼륨 확인
+docker volume ls | grep postgres
 ```
 
 ### Q4: 로컬과 Docker 간 전환하려면?
 ```bash
 # Docker -> 로컬
-cd docker && docker-compose down
+docker-compose down
 sudo service postgresql start
 
 # 로컬 -> Docker
 sudo service postgresql stop
-cd docker && docker-compose up -d
+docker-compose --env-file .env up -d
 ```
 
 ### Q5: pgvector 버전을 확인하려면?
@@ -375,10 +390,10 @@ Docker Desktop이 실행 중인지 확인하고, WSL2 터미널에서 실행하�
 ## 📌 유용한 명령어 모음
 
 ```bash
-# === 시작/중지 ===
-cd docker && docker-compose up -d    # 시작
-cd docker && docker-compose stop     # 중지
-cd docker && docker-compose restart  # 재시작
+# === 시작/중지 (프로젝트 루트에서) ===
+docker-compose --env-file .env up -d  # 시작
+docker-compose stop                   # 중지
+docker-compose restart                # 재시작
 
 # === 상태 확인 ===
 docker ps                            # 실행 중인 컨테이너
@@ -391,6 +406,7 @@ docker exec multimodal-rag-postgres pg_dump -U multimodal_user multimodal_rag > 
 
 # === 정리 ===
 docker-compose down                 # 컨테이너 제거
+docker-compose down -v              # 컨테이너와 볼륨 제거
 docker system prune -a              # 미사용 리소스 정리
 ```
 

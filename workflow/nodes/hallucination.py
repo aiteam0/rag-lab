@@ -9,12 +9,10 @@ from typing import Dict, Any, List
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 from workflow.state import MVPWorkflowState, QualityCheckResult
 
@@ -38,6 +36,7 @@ class HallucinationCheckNode:
     
     def __init__(self):
         """초기화"""
+        # ChatOpenAI 인스턴스 직접 생성
         self.llm = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0,  # 일관된 평가를 위해 temperature 0
@@ -99,6 +98,7 @@ Evaluate if the answer is grounded in the documents.
 List all claims and check each against the sources.""")
         ])
     
+    
     def _format_documents_for_checking(self, documents: List[Document]) -> str:
         """
         체크용 문서 포맷팅
@@ -114,19 +114,86 @@ List all claims and check each against the sources.""")
         
         formatted = []
         for idx, doc in enumerate(documents, 1):
+            # Document 객체 타입 검증 및 복원
+            if isinstance(doc, str):
+                # LangGraph가 Document를 string으로 직렬화한 경우
+                try:
+                    import json
+                    doc_dict = json.loads(doc)
+                    from langchain_core.documents import Document
+                    doc = Document(
+                        page_content=doc_dict.get("page_content", ""),
+                        metadata=doc_dict.get("metadata", {})
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"[HALLUCINATION] Failed to parse document string at index {idx}")
+                    continue
+            elif isinstance(doc, dict):
+                # LangGraph 직렬화로 dict가 된 경우
+                from langchain_core.documents import Document
+                doc = Document(
+                    page_content=doc.get("page_content", ""),
+                    metadata=doc.get("metadata", {})
+                )
+            elif not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
+                # 잘못된 형식의 객체인 경우
+                logger.warning(f"[HALLUCINATION] Invalid document format at index {idx}: {type(doc)}")
+                continue
+            
             metadata = doc.metadata
-            formatted.append(f"""
+            
+            # 기본 문서 정보
+            doc_text = f"""
 Document {idx}:
 - Source: {metadata.get('source', 'Unknown')}
 - Page: {metadata.get('page', 'N/A')}
-- Category: {metadata.get('category', 'Unknown')}
-- Full Content:
-{doc.page_content}
----""")
+- Category: {metadata.get('category', 'Unknown')}"""
+            
+            # Human feedback이 있으면 최우선으로 추가 (타입 안전성 보장)
+            human_feedback = metadata.get('human_feedback')
+            if human_feedback and isinstance(human_feedback, str) and human_feedback.strip():
+                doc_text += f"\n- Human Verified Content: {human_feedback}"
+            
+            # Entity 정보가 있으면 구조화된 형태로 추가 (타입 안전성 보장)
+            entity = metadata.get('entity')
+            if entity:
+                # entity가 dictionary가 아닌 경우 안전하게 처리
+                if not isinstance(entity, dict):
+                    doc_text += f"\n- Entity Info: {str(entity)}"
+                else:
+                    category = metadata.get('category', '')
+                    if category == 'table' and entity:
+                        doc_text += "\n- Table Information:"
+                        title = entity.get('title')
+                        if title and isinstance(title, str):
+                            doc_text += f"\n  Title: {title}"
+                        details = entity.get('details')
+                        if details and isinstance(details, str):
+                            doc_text += f"\n  Details: {details}"
+                        keywords = entity.get('keywords')
+                        if keywords and isinstance(keywords, list):
+                            doc_text += f"\n  Keywords: {', '.join(str(k) for k in keywords)}"
+                    elif category == 'figure' and entity:
+                        doc_text += "\n- Figure Information:"
+                        title = entity.get('title')
+                        if title and isinstance(title, str):
+                            doc_text += f"\n  Title: {title}"
+                        details = entity.get('details')
+                        if details and isinstance(details, str):
+                            doc_text += f"\n  Description: {details}"
+            
+            # 캡션이 있으면 추가
+            if metadata.get('caption'):
+                doc_text += f"\n- Caption: {metadata['caption']}"
+            
+            # 원본 콘텐츠
+            doc_text += f"\n- Full Content:\n{doc.page_content}\n---"
+            
+            formatted.append(doc_text)
         
         return "\n".join(formatted)
     
-    async def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
+    def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """
         노드 실행
         
@@ -179,9 +246,11 @@ Document {idx}:
             formatted_docs = self._format_documents_for_checking(documents)
             
             # LLM을 사용한 환각 체크
-            structured_llm = self.llm.with_structured_output(HallucinationCheckResult)
+            structured_llm = self.llm.with_structured_output(
+                HallucinationCheckResult
+            )
             
-            check_result = await structured_llm.ainvoke(
+            check_result = structured_llm.invoke(
                 self.hallucination_check_prompt.format_messages(
                     query=query,
                     answer=answer_to_check,
@@ -227,7 +296,51 @@ Document {idx}:
             if check_result.hallucination_score > 0.5:
                 warnings.append(f"High hallucination score: {check_result.hallucination_score:.2f}")
             
+            # 메시지 생성 - 환각 검증 과정 상세 정보
+            messages = []
+            
+            # 1. 검증 시작
+            messages.append(
+                AIMessage(content="🔍 환각 검증을 시작합니다...")
+            )
+            
+            # 2. 검증 항목별 점수
+            total_claims = len(check_result.supported_claims) + len(check_result.problematic_claims)
+            grounding_rate = (len(check_result.supported_claims) / total_claims * 100) if total_claims > 0 else 100
+            
+            messages.append(
+                AIMessage(content=f"""📊 검증 결과 상세:
+  • 전체 주장: {total_claims}개 검증
+  • 문서 확인됨: {len(check_result.supported_claims)}개 ✅
+  • 문서 미확인: {len(check_result.problematic_claims)}개 ⚠️
+  • 문서 근거율: {grounding_rate:.0f}%
+  • 환각 수준: {check_result.hallucination_score:.0%} (낮을수록 좋음)""")
+            )
+            
+            # 3. 종합 점수와 기준
+            messages.append(
+                AIMessage(content=f"📈 환각 점수: {check_result.hallucination_score:.0%} (기준: <{self.threshold:.0%})")
+            )
+            
+            # 4. 검증 결과
+            retry_count = state.get("retry_count", 0)
+            max_retries = int(os.getenv("CRAG_MAX_RETRIES", "3"))
+            if quality_check["is_valid"]:
+                messages.append(
+                    AIMessage(content="✅ 환각 검증 통과 - 답변이 문서 내용과 일치합니다")
+                )
+            else:
+                if needs_retry and retry_count < max_retries:
+                    messages.append(
+                        AIMessage(content=f"⚠️ 환각 감지 - 재생성 필요 (시도 {retry_count+1}/{max_retries})")
+                    )
+                else:
+                    messages.append(
+                        AIMessage(content="❌ 환각 검증 실패 - 최대 재시도 횟수 초과")
+                    )
+            
             return {
+                "messages": messages,  # 메시지 추가
                 "hallucination_check": quality_check,
                 "should_retry": needs_retry,
                 "metadata": metadata,
@@ -244,17 +357,5 @@ Document {idx}:
     
     def invoke(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """동기 실행 (LangGraph 호환성)"""
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        try:
-            # 이미 실행 중인 이벤트 루프가 있는지 확인
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # 이벤트 루프가 없으면 새로 생성하여 실행
-            return asyncio.run(self.__call__(state))
-        else:
-            # 이미 이벤트 루프가 실행 중이면 별도 스레드에서 실행
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, self.__call__(state))
-                return future.result()
+        logger.debug(f"[HALLUCINATION] Invoke called (sync wrapper)")
+        return self.__call__(state)

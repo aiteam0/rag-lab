@@ -9,12 +9,10 @@ from typing import Dict, Any, List
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 from workflow.state import MVPWorkflowState, QualityCheckResult
 
@@ -42,6 +40,7 @@ class AnswerGraderNode:
     
     def __init__(self):
         """초기화"""
+        # ChatOpenAI 인스턴스 직접 생성
         self.llm = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0,  # 일관된 평가를 위해 temperature 0
@@ -179,8 +178,8 @@ Identify strengths, weaknesses, and specific improvements needed.""")
         
         return min(overall, 1.0)
     
-    async def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
-        logger.info(f"[ANSWER_GRADER] Node started")
+    
+    def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """
         노드 실행
         
@@ -190,6 +189,7 @@ Identify strengths, weaknesses, and specific improvements needed.""")
         Returns:
             업데이트된 상태 필드
         """
+        logger.info(f"[ANSWER_GRADER] Node started")
         try:
             # 평가할 답변 가져오기
             answer_to_grade = state.get("intermediate_answer") or state.get("final_answer")
@@ -231,9 +231,11 @@ Identify strengths, weaknesses, and specific improvements needed.""")
             documents_summary = self._summarize_documents(documents)
             
             # LLM을 사용한 답변 평가
-            structured_llm = self.llm.with_structured_output(AnswerGradeResult)
+            structured_llm = self.llm.with_structured_output(
+                AnswerGradeResult
+            )
             
-            grade_result = await structured_llm.ainvoke(
+            grade_result = structured_llm.invoke(
                 self.grading_prompt.format_messages(
                     query=query,
                     answer=answer_to_grade,
@@ -301,7 +303,57 @@ Identify strengths, weaknesses, and specific improvements needed.""")
             if grade_result.missing_aspects:
                 warnings.append(f"Missing aspects: {', '.join(grade_result.missing_aspects[:3])}")
             
+            # 메시지 생성 - 품질 평가 결과 및 최종 답변
+            messages = []
+            
+            # 1. 평가 시작 메시지
+            messages.append(
+                AIMessage(content="🔍 답변 품질 평가를 시작합니다...")
+            )
+            
+            # 2. 평가 점수 상세
+            messages.append(
+                AIMessage(content=f"""📊 품질 평가 결과:
+  • 완전성: {grade_result.completeness_score:.0%}
+  • 관련성: {grade_result.relevance_score:.0%}
+  • 명확성: {grade_result.clarity_score:.0%}
+  • 유용성: {grade_result.usefulness_score:.0%}""")
+            )
+            
+            # 3. 종합 평가 및 최종 답변
+            if overall_score >= self.threshold:
+                # 품질 기준 통과
+                messages.append(
+                    AIMessage(content=f"✅ 답변 품질 검증 통과 (종합 점수: {overall_score:.0%})")
+                )
+                # 최종 답변 추가
+                if state.get("final_answer"):
+                    messages.append(
+                        AIMessage(content=state["final_answer"])
+                    )
+            else:
+                # 품질 기준 미달
+                retry_count = state.get("retry_count", 0)
+                max_retries = int(os.getenv("CRAG_MAX_RETRIES", "3"))
+                
+                if needs_retry and retry_count < max_retries:
+                    # 재시도 가능
+                    messages.append(
+                        AIMessage(content=f"⚠️ 답변 품질 미달 (종합 점수: {overall_score:.0%}) - 재시도 필요 ({retry_count+1}/{max_retries})")
+                    )
+                else:
+                    # 재시도 불가능 (최대 횟수 초과) - 부분 답변 제공
+                    messages.append(
+                        AIMessage(content=f"⚠️ 답변 품질 기준 미달 (종합 점수: {overall_score:.0%}) - 최선의 답변을 제공합니다")
+                    )
+                    # 부분 답변 제공
+                    if state.get("final_answer"):
+                        messages.append(
+                            AIMessage(content=f"📝 부분 답변:\n{state['final_answer']}\n\n⚠️ 참고: 이 답변은 품질 기준을 완전히 충족하지 못했습니다. 다음 이유로 제한적일 수 있습니다:\n- 완전성: {grade_result.completeness_score:.0%} (부족한 부분: {', '.join(missing_aspects[:3]) if missing_aspects else '없음'})\n- 관련성: {grade_result.relevance_score:.0%}\n- 명확성: {grade_result.clarity_score:.0%}")
+                        )
+            
             return {
+                "messages": messages,  # 메시지 추가
                 "answer_grade": quality_check,
                 "should_retry": needs_retry,
                 "metadata": metadata,
@@ -318,17 +370,5 @@ Identify strengths, weaknesses, and specific improvements needed.""")
     
     def invoke(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """동기 실행 (LangGraph 호환성)"""
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        try:
-            # 이미 실행 중인 이벤트 루프가 있는지 확인
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # 이벤트 루프가 없으면 새로 생성하여 실행
-            return asyncio.run(self.__call__(state))
-        else:
-            # 이미 이벤트 루프가 실행 중이면 별도 스레드에서 실행
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, self.__call__(state))
-                return future.result()
+        logger.debug(f"[ANSWER_GRADER] Invoke called (sync wrapper)")
+        return self.__call__(state)

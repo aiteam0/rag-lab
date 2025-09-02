@@ -29,6 +29,12 @@ async def test_planning_agent():
     # 테스트 케이스 정의
     test_cases = [
         {
+            "name": "Problem Query - Oil Change",
+            "query": "오일 교체에 대해 알려줘",
+            "expected_subtasks": 1,  # 1개가 적절함 (단순한 오일 교체 정보)
+            "description": "문제가 되는 쿼리 - 차량 안전 기능으로 잘못 해석되는 케이스"
+        },
+        {
             "name": "Simple Query",
             "query": "엔진 오일 교체 방법",
             "expected_subtasks": 1  # 최소 1개 이상

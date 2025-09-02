@@ -13,10 +13,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from workflow.state import MVPWorkflowState, SubtaskState
 import uuid
-import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 load_dotenv()
 
@@ -44,6 +41,7 @@ class PlanningAgentNode:
     
     def __init__(self):
         """초기화"""
+        # ChatOpenAI 인스턴스 직접 생성
         self.llm = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0,
@@ -95,10 +93,10 @@ Consider the following when creating subtasks:
 - MOST IMPORTANT: Are filter hints (table, image, page) preserved in each subtask?
 
 Examples:
-- "차량 안전 기능과 연비는?" → 2 subtasks (안전 기능, 연비)
-- "How to change oil?" → 1 subtask (oil change procedure)
-- "브레이크 시스템 작동 원리와 점검 방법" → 2 subtasks (작동 원리, 점검 방법)
-- "표로 정리된 엔진 오일 사양" → "표에 나온 엔진 오일의 사양" (PRESERVE "표")"""),
+- "A와 B에 대해 알려줘" → 2 subtasks focusing on what user asked (A information, B information)
+- "오일 교체 방법" → 1 subtask (오일 교체 절차)
+- "브레이크 점검과 정비" → 2 subtasks (브레이크 점검, 브레이크 정비)
+- "표로 정리된 엔진 사양" → "표에 나온 엔진 사양" (PRESERVE "표")"""),
             ("human", """Query: {query}
 
 Break this down into subtasks. Consider:
@@ -110,7 +108,8 @@ Break this down into subtasks. Consider:
 Create an execution plan with subtasks.""")
         ])
     
-    async def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
+    
+    def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """
         노드 실행
         
@@ -126,18 +125,50 @@ Create an execution plan with subtasks.""")
             query = state["query"]
             logger.debug(f"[PLANNING] Processing query: '{query}'")
             
-            # LLM을 사용하여 쿼리 분석 및 서브태스크 생성
-            logger.debug(f"[PLANNING] Creating structured LLM with max_subtasks={self.max_subtasks}")
-            structured_llm = self.llm.with_structured_output(ExecutionPlan)
+            # Multi-turn 대화에서 새로운 RAG 쿼리 시작 시 이전 문서 초기화
+            # Custom clearable_add reducer가 빈 리스트를 초기화 신호로 인식
+            logger.info(f"[PLANNING] Clearing previous documents for new RAG query")
             
-            logger.info(f"[PLANNING] Generating execution plan...")
-            plan = await structured_llm.ainvoke(
-                self.planning_prompt.format_messages(
+            # LLM을 사용하여 쿼리 분석 및 서브태스크 생성 (structured output 사용)
+            logger.debug(f"[PLANNING] Creating structured LLM with max_subtasks={self.max_subtasks}")
+            try:
+                structured_llm = self.llm.with_structured_output(
+                    ExecutionPlan
+                )
+                
+                logger.info(f"[PLANNING] Generating execution plan...")
+                formatted_messages = self.planning_prompt.format_messages(
                     query=query,
                     max_subtasks=self.max_subtasks
                 )
-            )
+                
+                # 디버깅: 프롬프트 내용 로깅
+                logger.debug(f"[PLANNING] Input query: '{query}'")
+                logger.debug(f"[PLANNING] Formatted prompt (last 500 chars): ...{str(formatted_messages)[-500:]}")
+                
+                plan = structured_llm.invoke(formatted_messages)
+            except Exception as e:
+                logger.error(f"[PLANNING] Failed to generate execution plan: {e}")
+                raise ValueError(f"Planning failed: {e}")
+            
+            # 디버깅: ExecutionPlan 상세 정보 로깅
             logger.info(f"[PLANNING] Generated {len(plan.subtasks)} subtasks, strategy: {plan.strategy}")
+            logger.info(f"[PLANNING] Original query: '{query}'")
+            logger.info(f"[PLANNING] Generated strategy: '{plan.strategy}'")
+            logger.info(f"[PLANNING] Expected complexity: '{plan.expected_complexity}'")
+            
+            # 각 서브태스크 상세 정보 로깅
+            for i, subtask in enumerate(plan.subtasks):
+                logger.info(f"[PLANNING] Subtask {i+1}: '{subtask.query}' (priority: {subtask.priority}, lang: {subtask.search_language})")
+                if subtask.dependencies:
+                    logger.info(f"[PLANNING]   Dependencies: {subtask.dependencies}")
+            
+            # 원본 쿼리와 생성된 서브태스크 간의 관련성 확인
+            original_keywords = query.lower().split()
+            for i, subtask in enumerate(plan.subtasks):
+                subtask_keywords = subtask.query.lower().split()
+                common_keywords = set(original_keywords) & set(subtask_keywords)
+                logger.info(f"[PLANNING] Subtask {i+1} keyword overlap with original: {len(common_keywords)}/{len(original_keywords)} - {list(common_keywords)}")
             
             # 서브태스크를 상태 형식으로 변환
             subtasks = []
@@ -178,9 +209,11 @@ Create an execution plan with subtasks.""")
                 logger.info(f"[PLANNING] Subtask {i+1}: [P:{priority}] \"{query_preview}\"")
             
             # 메시지 생성 (스트리밍 지원)
+            # 서브태스크 목록 생성
+            subtask_list = "\n".join([f"  {i+1}. {task['query']}" for i, task in enumerate(subtasks)])
+            
             messages = [
-                AIMessage(content=f"📋 쿼리를 {len(subtasks)}개의 서브태스크로 분해했습니다."),
-                AIMessage(content=f"🎯 실행 전략: {plan.strategy}")
+                AIMessage(content=f"📋 다음 {len(subtasks)}개 작업으로 나누어 검색합니다:\n{subtask_list}")
             ]
             
             result = {
@@ -189,7 +222,8 @@ Create an execution plan with subtasks.""")
                 "current_subtask_idx": 0,
                 "metadata": metadata,
                 "workflow_status": "running",
-                "current_node": "planning"
+                "current_node": "planning",
+                "documents": []  # Custom reducer가 빈 리스트를 초기화 신호로 인식
             }
             logger.info(f"[PLANNING] Node completed successfully")
             return result
@@ -204,20 +238,4 @@ Create an execution plan with subtasks.""")
     def invoke(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """동기 실행 (LangGraph 호환성)"""
         logger.debug(f"[PLANNING] Invoke called (sync wrapper)")
-        
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        try:
-            # 이미 실행 중인 이벤트 루프가 있는지 확인
-            loop = asyncio.get_running_loop()
-            logger.debug(f"[PLANNING] Event loop detected, using ThreadPoolExecutor")
-        except RuntimeError:
-            # 이벤트 루프가 없으면 새로 생성하여 실행
-            logger.debug(f"[PLANNING] No event loop, creating new one")
-            return asyncio.run(self.__call__(state))
-        else:
-            # 이미 이벤트 루프가 실행 중이면 별도 스레드에서 실행
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, self.__call__(state))
-                return future.result()
+        return self.__call__(state)

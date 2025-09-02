@@ -24,6 +24,48 @@ from ingest.models import DDUDocument
 load_dotenv()
 
 
+def extract_entity_text(entity_dict: dict) -> str:
+    """
+    Entity 딕셔너리에서 검색 가능한 텍스트 추출
+    
+    Args:
+        entity_dict: Entity 정보를 담은 딕셔너리
+        
+    Returns:
+        검색용 텍스트 문자열
+    """
+    if not entity_dict:
+        return ""
+    
+    text_parts = []
+    
+    # title 추출
+    if entity_dict.get("title"):
+        text_parts.append(str(entity_dict["title"]))
+    
+    # details 추출
+    if entity_dict.get("details"):
+        text_parts.append(str(entity_dict["details"]))
+    
+    # keywords 리스트 추출
+    if entity_dict.get("keywords"):
+        keywords = entity_dict["keywords"]
+        if isinstance(keywords, list):
+            text_parts.extend([str(k) for k in keywords if k])
+        elif isinstance(keywords, str):
+            text_parts.append(keywords)
+    
+    # hypothetical_questions 리스트 추출
+    if entity_dict.get("hypothetical_questions"):
+        questions = entity_dict["hypothetical_questions"]
+        if isinstance(questions, list):
+            text_parts.extend([str(q) for q in questions if q])
+        elif isinstance(questions, str):
+            text_parts.append(questions)
+    
+    return " ".join(text_parts)
+
+
 async def ingest_documents(pickle_path: str, batch_size: int = 10):
     """
     DDU 문서 인제스트
@@ -132,12 +174,16 @@ async def ingest_documents(pickle_path: str, batch_size: int = 10):
                         doc_dict.get("human_feedback", ""),
                         korean_emb_str,  # 문자열로 변환된 벡터
                         english_emb_str,  # 문자열로 변환된 벡터
-                        # 한국어 검색 텍스트
+                        # 한국어 검색 텍스트 (entity와 human_feedback 포함)
                         (doc_dict.get("contextualize_text", "") + " " + 
                          doc_dict.get("page_content", "") + " " +
-                         doc_dict.get("caption", "")),
-                        # 영어 검색 텍스트
-                        doc_dict.get("translation_text", "")
+                         doc_dict.get("caption", "") + " " +
+                         extract_entity_text(doc_dict.get("entity", {})) + " " +
+                         doc_dict.get("human_feedback", "")),
+                        # 영어 검색 텍스트 (entity와 human_feedback 포함)
+                        (doc_dict.get("translation_text", "") + " " +
+                         extract_entity_text(doc_dict.get("entity", {})) + " " +
+                         doc_dict.get("human_feedback", ""))
                     )
                 
                 success_count += 1
@@ -217,7 +263,8 @@ def main():
     print("=" * 60)
     
     # 기본 pickle 파일 경로
-    default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/gv80_owners_manual_TEST6P_documents.pkl"
+    #default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/gv80_owners_manual_TEST6P_documents.pkl"
+    default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/merged_ddu_documents.pkl"
     
     # Pickle 파일 선택
     if os.path.exists(default_pickle):

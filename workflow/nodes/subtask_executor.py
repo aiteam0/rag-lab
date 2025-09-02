@@ -5,16 +5,16 @@ Subtask Executor Node
 
 import os
 import logging
+import time
 from typing import Dict, Any, List, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import asyncpg
-import nest_asyncio
+import psycopg
+from psycopg_pool import ConnectionPool
+from concurrent.futures import ThreadPoolExecutor
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 from workflow.state import MVPWorkflowState
 from retrieval.search_filter import MVPSearchFilter
@@ -48,7 +48,7 @@ class DDUFilterGeneration(BaseModel):
     sources: List[str] = Field(default_factory=list, description="Source files to filter (only if explicitly mentioned)")
     caption: Optional[str] = Field(None, description="Caption text to search")
     entity: Optional[Dict[str, Any]] = Field(None, description="Entity filter (type must be 'image' or 'table')")
-    reasoning: str = Field(description="Reasoning for filter selection")
+    reasoning: str = Field(default="", description="Reasoning for filter selection")
 
 
 class MetadataHelper:
@@ -71,45 +71,110 @@ class MetadataHelper:
             f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT', '5432')}"
             f"/{os.getenv('DB_NAME')}"
         )
+        self._stats_cache = None
+        self._cache_time = 0
     
-    async def get_metadata(self) -> Dict[str, Any]:
+    def get_metadata(self) -> Dict[str, Any]:
         """DB에서 최소한의 정확한 메타데이터만 조회"""
         try:
-            conn = await asyncpg.connect(self.db_connection_string)
-            
-            try:
-                # 1. 사용 가능한 카테고리 (실제 존재하는 것만)
-                categories = await conn.fetch(
-                    """SELECT DISTINCT category 
-                    FROM mvp_ddu_documents 
-                    ORDER BY category"""
-                )
-                
-                # 2. 실제 존재하는 Entity 타입
-                entity_types = await conn.fetch(
-                    """SELECT DISTINCT entity->>'type' as type
-                    FROM mvp_ddu_documents 
-                    WHERE entity IS NOT NULL 
-                    AND entity->>'type' IS NOT NULL
-                    ORDER BY entity->>'type'"""
-                )
-                
-                # 3. Source 목록 (참고용)
-                sources = await conn.fetch(
-                    "SELECT DISTINCT source FROM mvp_ddu_documents ORDER BY source"
-                )
-                
-                return {
-                    "categories": [r['category'] for r in categories],
-                    "entity_types": [r['type'] for r in entity_types],
-                    "available_sources": [r['source'] for r in sources]
-                }
-                
-            finally:
-                await conn.close()
+            with psycopg.connect(self.db_connection_string) as conn:
+                with conn.cursor() as cur:
+                    # 1. 사용 가능한 카테고리 (실제 존재하는 것만)
+                    cur.execute(
+                        """SELECT DISTINCT category 
+                        FROM mvp_ddu_documents 
+                        ORDER BY category"""
+                    )
+                    categories = cur.fetchall()
+                    
+                    # 2. 실제 존재하는 Entity 타입
+                    cur.execute(
+                        """SELECT DISTINCT entity->>'type' as type
+                        FROM mvp_ddu_documents 
+                        WHERE entity IS NOT NULL 
+                        AND entity->>'type' IS NOT NULL
+                        ORDER BY entity->>'type'"""
+                    )
+                    entity_types = cur.fetchall()
+                    
+                    # 3. Source 목록 (참고용)
+                    cur.execute(
+                        "SELECT DISTINCT source FROM mvp_ddu_documents ORDER BY source"
+                    )
+                    sources = cur.fetchall()
+                    
+                    return {
+                        "categories": [r[0] for r in categories],
+                        "entity_types": [r[0] for r in entity_types],
+                        "available_sources": [r[0] for r in sources]
+                    }
                 
         except Exception as e:
             raise RuntimeError(f"Failed to fetch metadata from database: {str(e)}")
+    
+    def get_system_stats(self) -> Dict[str, Any]:
+        """시스템 기본 통계 조회 (캐싱 포함)"""
+        # 5분 캐싱 체크
+        if self._stats_cache and (time.time() - self._cache_time < 300):
+            return self._stats_cache
+        
+        try:
+            with psycopg.connect(self.db_connection_string) as conn:
+                with conn.cursor() as cur:
+                    # 한 번의 쿼리로 모든 기본 정보 조회
+                    cur.execute("""
+                        SELECT 
+                            COUNT(*) as total_docs,
+                            COUNT(DISTINCT source) as source_count,
+                            COUNT(DISTINCT category) as category_count,
+                            MIN(page) as min_page,
+                            MAX(page) as max_page,
+                            COUNT(CASE WHEN embedding_korean IS NOT NULL THEN 1 END) as korean_emb,
+                            COUNT(CASE WHEN embedding_english IS NOT NULL THEN 1 END) as english_emb
+                        FROM mvp_ddu_documents
+                    """)
+                    stats = cur.fetchone()
+                    
+                    # 소스별 문서 수
+                    cur.execute("""
+                        SELECT source, COUNT(*) as count
+                        FROM mvp_ddu_documents 
+                        GROUP BY source
+                        ORDER BY count DESC
+                    """)
+                    sources = dict(cur.fetchall())
+                    
+                    # 카테고리별 분포 (상위 5개)
+                    cur.execute("""
+                        SELECT category, COUNT(*) as count
+                        FROM mvp_ddu_documents
+                        GROUP BY category
+                        ORDER BY count DESC
+                        LIMIT 5
+                    """)
+                    categories = dict(cur.fetchall())
+                    
+                    self._stats_cache = {
+                        "total_documents": stats[0],
+                        "sources": sources,
+                        "source_count": stats[1],
+                        "category_count": stats[2],
+                        "page_range": f"{stats[3]}-{stats[4]}" if stats[3] else "N/A",
+                        "korean_embeddings": stats[5],
+                        "english_embeddings": stats[6],
+                        "top_categories": categories
+                    }
+                    self._cache_time = time.time()
+                    return self._stats_cache
+                    
+        except Exception as e:
+            logger.error(f"Failed to fetch system stats: {e}")
+            # 에러 시 기본값 반환
+            return {
+                "total_documents": "unknown",
+                "sources": {},
+                "error": str(e)
+            }
 
 
 class SubtaskExecutorNode:
@@ -117,6 +182,7 @@ class SubtaskExecutorNode:
     
     def __init__(self):
         """초기화"""
+        # ChatOpenAI 인스턴스 직접 생성
         self.llm = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0.3,
@@ -240,25 +306,28 @@ Extracted info: {extraction}
 Generate MINIMAL filter (prefer empty over wrong):""")
         ])
     
-    async def _generate_query_variations(self, query: str) -> List[str]:
+    def _get_metadata_sync(self) -> Dict[str, Any]:
+        """메타데이터를 동기 방식으로 가져오기"""
+        # 이제 get_metadata()가 동기 메서드이므로 직접 호출
+        return self.metadata_helper.get_metadata()
+    
+    def _generate_query_variations(self, query: str) -> List[str]:
         """쿼리 변형 생성"""
         structured_llm = self.llm.with_structured_output(
-            QueryVariations,
-            method="function_calling"
+            QueryVariations
         )
         
-        result = await structured_llm.ainvoke(
+        result = structured_llm.invoke(
             self.variation_prompt.format_messages(query=query)
         )
         
         # 원본 쿼리를 첫 번째로, 변형들을 추가
         return [query] + result.variations
     
-    async def _extract_query_info(self, query: str, metadata: Dict[str, Any]) -> QueryExtraction:
+    def _extract_query_info(self, query: str, metadata: Dict[str, Any]) -> QueryExtraction:
         """쿼리에서 필터링 정보 추출 (보수적)"""
         structured_llm = self.llm.with_structured_output(
-            QueryExtraction,
-            method="function_calling"
+            QueryExtraction
         )
         
         # 카테고리와 entity types, sources 문자열로 변환
@@ -266,7 +335,7 @@ Generate MINIMAL filter (prefer empty over wrong):""")
         entity_types_str = ", ".join(metadata.get("entity_types", []))
         sources_str = ", ".join(metadata.get("available_sources", []))
         
-        result = await structured_llm.ainvoke(
+        result = structured_llm.invoke(
             self.extraction_prompt.format_messages(
                 query=query,
                 categories=categories_str,
@@ -288,7 +357,7 @@ Generate MINIMAL filter (prefer empty over wrong):""")
         
         return result
     
-    async def _generate_filter(
+    def _generate_filter(
         self,
         query: str,
         extraction: QueryExtraction,
@@ -303,7 +372,7 @@ Generate MINIMAL filter (prefer empty over wrong):""")
         entity_types_str = ", ".join(metadata.get("entity_types", []))
         sources_str = ", ".join(metadata.get("available_sources", []))
         
-        result = await structured_llm.ainvoke(
+        result = structured_llm.invoke(
             self.filter_prompt.format_messages(
                 query=query,
                 extraction=extraction.model_dump(),
@@ -340,9 +409,11 @@ Generate MINIMAL filter (prefer empty over wrong):""")
             entity=result.entity
         )
     
-    async def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
+    
+    def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """노드 실행"""
         logger.info(f"[SUBTASK_EXECUTOR] Node started")
+        
         
         try:
             # 현재 서브태스크 가져오기
@@ -428,14 +499,15 @@ Generate MINIMAL filter (prefer empty over wrong):""")
             
             # DB 메타데이터 가져오기 (필수)
             logger.debug(f"[SUBTASK_EXECUTOR] Fetching DB metadata...")
-            metadata = await self.metadata_helper.get_metadata()
+            # 동기 방식으로 메타데이터 가져오기
+            metadata = self._get_metadata_sync()
             available_categories = metadata.get("categories", [])
             available_entity_types = metadata.get("entity_types", [])
             logger.debug(f"[SUBTASK_EXECUTOR] DB metadata: {len(available_categories)} categories, {len(available_entity_types)} entity types")
             
             # 1. 쿼리 변형 생성 (Multi-Query)
             logger.info(f"[SUBTASK_EXECUTOR] Generating query variations for: '{query}'")
-            variations = await self._generate_query_variations(query)
+            variations = self._generate_query_variations(query)
             logger.info(f"[SUBTASK_EXECUTOR] Generated {len(variations)} query variations")
             
             # 쿼리 변형 상세 정보 로깅
@@ -446,7 +518,7 @@ Generate MINIMAL filter (prefer empty over wrong):""")
             
             # 2. 쿼리 정보 추출 (보수적)
             logger.debug(f"[SUBTASK_EXECUTOR] Extracting query information...")
-            extraction = await self._extract_query_info(query, metadata)
+            extraction = self._extract_query_info(query, metadata)
             logger.info(f"[SUBTASK_EXECUTOR] Extracted info:")
             logger.info(f"  - pages: {extraction.page_numbers}")
             logger.info(f"  - categories_mentioned: {extraction.categories_mentioned}")
@@ -457,7 +529,7 @@ Generate MINIMAL filter (prefer empty over wrong):""")
             
             # 3. 최소 검색 필터 생성
             logger.debug(f"[SUBTASK_EXECUTOR] Generating search filter...")
-            search_filter = await self._generate_filter(query, extraction, metadata)
+            search_filter = self._generate_filter(query, extraction, metadata)
             filter_dict = search_filter.to_dict() if search_filter else None
             
             if filter_dict:
@@ -493,6 +565,9 @@ Generate MINIMAL filter (prefer empty over wrong):""")
             }
             logger.debug(f"[SUBTASK_EXECUTOR] Updated task metadata for subtask_{current_idx}")
             
+            # Only pass through documents when coming from planning (index 0)
+            # to preserve the clearing signal. For other cases, don't include documents
+            # to avoid duplication issues with the add reducer
             result = {
                 "subtasks": subtasks,
                 "current_subtask_idx": current_idx,  # 현재 처리 중인 서브태스크 인덱스 반환
@@ -500,6 +575,12 @@ Generate MINIMAL filter (prefer empty over wrong):""")
                 "metadata": task_metadata,
                 "query_variations": variations  # Retrieval Node에서 사용 (state.py의 필드명과 일치)
             }
+            
+            # Only include documents field when it's the first subtask (to pass the clearing signal)
+            if current_idx == 0 and len(state.get("documents", [])) == 0:
+                result["documents"] = []  # Pass empty list to trigger clearing
+                logger.info(f"[SUBTASK_EXECUTOR] Passing document clearing signal for first subtask")
+            
             logger.info(f"[SUBTASK_EXECUTOR] Node completed successfully - prepared {len(variations)} variations for retrieval")
             return result
             
@@ -522,20 +603,4 @@ Generate MINIMAL filter (prefer empty over wrong):""")
     def invoke(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """동기 실행 (LangGraph 호환성)"""
         logger.debug(f"[SUBTASK_EXECUTOR] Invoke called (sync wrapper)")
-        
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        try:
-            # 이미 실행 중인 이벤트 루프가 있는지 확인
-            loop = asyncio.get_running_loop()
-            logger.debug(f"[SUBTASK_EXECUTOR] Event loop detected, using ThreadPoolExecutor")
-        except RuntimeError:
-            # 이벤트 루프가 없으면 새로 생성하여 실행
-            logger.debug(f"[SUBTASK_EXECUTOR] No event loop, creating new one")
-            return asyncio.run(self.__call__(state))
-        else:
-            # 이미 이벤트 루프가 실행 중이면 별도 스레드에서 실행
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, self.__call__(state))
-                return future.result()
+        return self.__call__(state)

@@ -12,10 +12,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 load_dotenv()
 

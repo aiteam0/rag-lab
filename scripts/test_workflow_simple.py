@@ -85,10 +85,12 @@ def test_simple_workflow():
         cited_nums = synthesis_meta.get('sources', [])[:5] if result.get("metadata", {}).get("synthesis") else []
         for num_str in cited_nums:
             try:
-                idx = int(num_str) - 1  # 1-based to 0-based
+                # Remove brackets if present (e.g., '[1]' -> '1')
+                cleaned_num = num_str.strip('[]')
+                idx = int(cleaned_num) - 1  # 1-based to 0-based
                 if 0 <= idx < len(documents):
                     doc = documents[idx]
-                    print(f"   [{num_str}] {doc.metadata.get('source', 'Unknown')} p.{doc.metadata.get('page', '?')} - {doc.page_content[:50]}...")
+                    print(f"   [{cleaned_num}] {doc.metadata.get('source', 'Unknown')} p.{doc.metadata.get('page', '?')} - {doc.page_content[:50]}...")
             except Exception as e:
                 print(f"   Error processing document {num_str}: {e}")
         

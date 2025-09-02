@@ -9,12 +9,10 @@ from typing import Dict, Any, List
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 from workflow.state import MVPWorkflowState
 
@@ -38,6 +36,7 @@ class SynthesisNode:
     
     def __init__(self):
         """초기화"""
+        # ChatOpenAI 인스턴스 직접 생성
         self.llm = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0.1,  # 더 일관된 답변을 위해 낮은 temperature
@@ -49,21 +48,51 @@ class SynthesisNode:
             ("system", """You are an expert assistant for an automobile manufacturing RAG system.
 Your task is to generate comprehensive and accurate answers based on the retrieved documents.
 
+CRITICAL - Information Priority Hierarchy:
+1. **HIGHEST PRIORITY - Human Verified Content**: If a document has "Human Verified" information, this is the ground truth and should be used as the primary source
+2. **HIGH PRIORITY - Structured Entity Data**: Table and Figure information with titles, details, and keywords provide structured context
+3. **STANDARD PRIORITY - Document Content**: Regular document text is the baseline information source
+
 Guidelines:
 1. Base your answer ONLY on the provided documents
-2. If information is not in the documents, say so clearly
-3. Cite sources using reference numbers [1], [2], etc. in the main text
-4. Structure your answer clearly with proper formatting
-5. For Korean documents, maintain Korean terms where appropriate
-6. Include specific details like numbers, procedures, and specifications
-7. If there are conflicting information, mention both sources and explain
-8. Use the same reference number for the same document throughout the answer
-9. Place reference numbers immediately after the relevant statement
+2. When human feedback exists, prioritize it over other sources
+3. When entity information exists (tables/figures), use the structured data to provide precise details
+4. If information is not in the documents, say so clearly
+5. Cite sources using reference numbers [1], [2], etc. in the main text
+6. Structure your answer clearly with proper formatting
+7. **CRITICAL: For Korean documents, preserve the EXACT original terms and expressions**
+   - Use original Korean terms exactly as written
+   - Maintain parenthetical expressions as-is
+   - Do NOT paraphrase or reword key terms from the source documents
+8. Include specific details like numbers, procedures, and specifications
+9. If there are conflicting information, human feedback takes precedence
+10. Use the same reference number for the same document throughout the answer
+11. Place reference numbers immediately after the relevant statement
+12. When quoting or referencing policy terms, use the exact wording from the source
+
+Page Image Display Guidelines:
+13. **IMPORTANT**: If retrieved documents have page images (page_image_path in metadata):
+    - Collect all unique page images from cited documents
+    - Display them at the END of your answer in a dedicated section
+    - Group by source document and order by page number
+    - Format: ![Source Page X](path) for markdown rendering
+14. Page Image Section Format:
+    ```
+    ## 참조 페이지 이미지 (Referenced Page Images)
+    
+    ### {{source_name}}
+    ![Page 1](data/images/filename-page-1.png)
+    ![Page 3](data/images/filename-page-3.png)
+    
+    ### {{another_source}}
+    ![Page 2](data/images/another-page-2.png)
+    ```
 
 Answer Structure:
 - Start with a direct answer to the question
 - Provide supporting details from documents with inline citations [1], [2]
 - Include relevant warnings or cautions if mentioned
+- **NEW**: Add "참조 페이지 이미지 (Referenced Page Images)" section if page images exist
 - End with a "References" section listing all cited documents
 
 References Format:
@@ -101,21 +130,14 @@ Put it in the references_table field."""),
 Retrieved Documents:
 {documents}
 
-Generate a structured response with ALL these fields:
+Generate a comprehensive response with the following structure:
 1. answer: Comprehensive answer with inline citations [1], [2], etc.
 2. confidence: Your confidence score (0.0-1.0)
 3. sources_used: List like ['[1]', '[2]', '[3]'] for all cited documents
 4. key_points: Main points extracted from documents
-5. references_table: MANDATORY markdown table with this format:
+5. references_table: MANDATORY markdown table with source information
 
-| 참조번호 | 문서명 | 페이지 | 내용 요약 |
-|---------|--------|--------|-----------|
-| [1] | gv80_manual.pdf | p.245 | Engine oil change procedure |
-| [2] | maintenance.pdf | p.52 | Oil specifications and capacity |
-
-CRITICAL: The references_table field MUST be filled with the actual table.
-Extract source filename and page from each document's metadata.
-Generate your structured response now:""")
+Extract source filename and page from each document's metadata for proper references.""")
         ])
         
         # 문서 포맷팅 템플릿
@@ -126,9 +148,101 @@ Generate your structured response now:""")
 - Category: {category}
 - Content: {content}
 {caption}
+{entity_info}
+{human_feedback}
+{page_image_note}
 ---
 Note: Use [{idx}] when citing this document in your answer.
 """
+    
+    
+    def _format_entity_info(self, metadata: dict) -> str:
+        """
+        Entity 정보를 적절한 형식으로 포맷팅 (타입 안전성 보장)
+        
+        Args:
+            metadata: 문서 메타데이터
+            
+        Returns:
+            포맷팅된 entity 정보
+        """
+        entity = metadata.get("entity")
+        if not entity:
+            return ""
+        
+        # entity가 dictionary가 아닌 경우 안전하게 처리
+        if not isinstance(entity, dict):
+            # entity가 string이거나 다른 타입인 경우 기본 정보만 표시
+            return f"- Entity Info: {str(entity)}\n"
+        
+        category = metadata.get("category", "")
+        
+        # 테이블인 경우: 구조화된 정보 제공
+        if category == "table" and entity:
+            entity_text = "- Table: "
+            title = entity.get("title")
+            if title and isinstance(title, str):
+                entity_text += f"{title}\n"
+            details = entity.get("details")
+            if details and isinstance(details, str):
+                entity_text += f"  Details: {details}\n"
+            keywords = entity.get("keywords")
+            if keywords and isinstance(keywords, list):
+                entity_text += f"  Keywords: {', '.join(str(k) for k in keywords)}\n"
+            return entity_text.rstrip()
+        
+        # 그림인 경우: 설명 포함
+        elif category == "figure" and entity:
+            entity_text = "- Figure: "
+            title = entity.get("title")
+            if title and isinstance(title, str):
+                entity_text += f"{title}\n"
+            details = entity.get("details")
+            if details and isinstance(details, str):
+                entity_text += f"  Description: {details}\n"
+            return entity_text.rstrip()
+        
+        return ""
+    
+    def _collect_page_images(self, documents: List[Document]) -> List[Dict[str, Any]]:
+        """
+        문서들에서 유니크한 페이지 이미지 수집
+        
+        Args:
+            documents: 검색된 문서 리스트
+            
+        Returns:
+            페이지 이미지 정보를 담은 딕셔너리 리스트
+        """
+        page_images = []
+        seen_paths = set()
+        
+        for doc in documents:
+            if not isinstance(doc, Document):
+                continue
+                
+            metadata = doc.metadata or {}
+            page_image_path = metadata.get("page_image_path", "")
+            
+            # 유효한 경로이고 중복되지 않은 경우만 추가
+            if page_image_path and page_image_path not in seen_paths:
+                seen_paths.add(page_image_path)
+                
+                # source 파일명 추출 (표시용)
+                source = metadata.get("source", "")
+                source_name = os.path.basename(source) if source else "Unknown"
+                
+                page_images.append({
+                    "path": page_image_path,
+                    "page": metadata.get("page", 0),
+                    "source": source_name,
+                    "category": metadata.get("category", "")
+                })
+        
+        # 페이지 번호순으로 정렬
+        page_images.sort(key=lambda x: (x["source"], x["page"]))
+        
+        return page_images
     
     def _format_documents(self, documents: List[Document], truncate: bool = False) -> str:
         """
@@ -146,12 +260,53 @@ Note: Use [{idx}] when citing this document in your answer.
         
         formatted_docs = []
         for idx, doc in enumerate(documents, 1):
+            # Document 객체 타입 검증 및 복원
+            if isinstance(doc, str):
+                # LangGraph가 Document를 string으로 직렬화한 경우
+                try:
+                    import json
+                    doc_dict = json.loads(doc)
+                    from langchain_core.documents import Document
+                    doc = Document(
+                        page_content=doc_dict.get("page_content", ""),
+                        metadata=doc_dict.get("metadata", {})
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"[SYNTHESIS] Failed to parse document string at index {idx}")
+                    continue
+            elif isinstance(doc, dict):
+                # LangGraph 직렬화로 dict가 된 경우
+                from langchain_core.documents import Document
+                doc = Document(
+                    page_content=doc.get("page_content", ""),
+                    metadata=doc.get("metadata", {})
+                )
+            elif not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
+                # 잘못된 형식의 객체인 경우
+                logger.warning(f"[SYNTHESIS] Invalid document format at index {idx}: {type(doc)}")
+                continue
+            
             metadata = doc.metadata
             
             # 캡션이 있으면 추가
             caption_text = ""
             if metadata.get("caption"):
                 caption_text = f"- Caption: {metadata['caption']}"
+            
+            # Entity 정보 포맷팅
+            entity_info_text = self._format_entity_info(metadata)
+            
+            # Human feedback이 있으면 추가 (타입 안전성 보장)
+            human_feedback_text = ""
+            human_feedback = metadata.get("human_feedback")
+            if human_feedback and isinstance(human_feedback, str) and human_feedback.strip():
+                human_feedback_text = f"- Human Verified: {human_feedback}"
+            
+            # 페이지 이미지 경로가 있으면 노트 추가
+            page_image_path = metadata.get("page_image_path", "")
+            page_image_note = ""
+            if page_image_path and isinstance(page_image_path, str) and page_image_path.strip():
+                page_image_note = f"- Page Image Available: {page_image_path}"
             
             # 문서 내용 (truncate가 True일 때만 축약)
             content = doc.page_content[:500] if truncate else doc.page_content
@@ -162,13 +317,16 @@ Note: Use [{idx}] when citing this document in your answer.
                 page=metadata.get("page", "N/A"),
                 category=metadata.get("category", "Unknown"),
                 content=content,
-                caption=caption_text
+                caption=caption_text,
+                entity_info=entity_info_text,
+                human_feedback=human_feedback_text,
+                page_image_note=page_image_note
             )
             formatted_docs.append(formatted_doc)
         
         return "\n".join(formatted_docs)
     
-    async def _generate_answer_with_fallback(
+    def _generate_answer_with_fallback(
         self, 
         query: str, 
         documents: List[Document]
@@ -183,18 +341,52 @@ Note: Use [{idx}] when citing this document in your answer.
         Returns:
             생성된 답변 결과
         """
+        # 페이지 이미지 수집
+        page_images = self._collect_page_images(documents)
+        
         # 먼저 전체 문서로 시도
         try:
             formatted_docs = self._format_documents(documents, truncate=False)
             
-            structured_llm = self.llm.with_structured_output(SynthesisResult)
+            # 페이지 이미지 섹션 추가
+            if page_images:
+                image_section = "\n\n## Page Images Available for Reference:\n"
+                current_source = None
+                
+                for img in page_images:
+                    # 소스별로 그룹화
+                    if img['source'] != current_source:
+                        current_source = img['source']
+                        image_section += f"\n### From {current_source}:\n"
+                    
+                    image_section += f"- Page {img['page']}: {img['path']}\n"
+                
+                formatted_docs += image_section
             
-            result = await structured_llm.ainvoke(
+            structured_llm = self.llm.with_structured_output(
+                SynthesisResult
+            )
+            
+            result = structured_llm.invoke(
                 self.synthesis_prompt.format_messages(
                     query=query,
                     documents=formatted_docs
                 )
             )
+            
+            # 생성된 답변 로깅
+            logger.info(f"[SYNTHESIS] === Generated Answer Summary ===")
+            logger.info(f"[SYNTHESIS] Query: {query}")
+            logger.info(f"[SYNTHESIS] Answer Length: {len(result.answer)} chars")
+            logger.info(f"[SYNTHESIS] Confidence: {result.confidence:.2f}")
+            logger.info(f"[SYNTHESIS] Sources Used: {result.sources_used}")
+            logger.info(f"[SYNTHESIS] Key Points Count: {len(result.key_points)}")
+            if result.key_points:
+                logger.info(f"[SYNTHESIS] First Key Point: {result.key_points[0]}")
+            logger.info(f"[SYNTHESIS] Full Answer:")
+            logger.info(f"[SYNTHESIS] {result.answer}")
+            logger.info(f"[SYNTHESIS] === End of Answer ===")
+            
             return result
             
         except Exception as e:
@@ -205,20 +397,43 @@ Note: Use [{idx}] when citing this document in your answer.
                 # 문서 축약하여 재시도
                 formatted_docs = self._format_documents(documents, truncate=True)
                 
-                structured_llm = self.llm.with_structured_output(SynthesisResult)
+                # 페이지 이미지 섹션 추가 (truncate에서도 동일하게)
+                if page_images:
+                    image_section = "\n\n## Page Images Available for Reference:\n"
+                    current_source = None
+                    
+                    for img in page_images:
+                        # 소스별로 그룹화
+                        if img['source'] != current_source:
+                            current_source = img['source']
+                            image_section += f"\n### From {current_source}:\n"
+                        
+                        image_section += f"- Page {img['page']}: {img['path']}\n"
+                    
+                    formatted_docs += image_section
                 
-                result = await structured_llm.ainvoke(
+                structured_llm = self.llm.with_structured_output(
+                    SynthesisResult
+                )
+                
+                result = structured_llm.invoke(
                     self.synthesis_prompt.format_messages(
                         query=query,
                         documents=formatted_docs
                     )
                 )
+                
+                # Fallback 시에도 답변 로깅
+                logger.warning(f"[SYNTHESIS] Generated answer using truncated documents (fallback)")
+                logger.info(f"[SYNTHESIS] Answer Length: {len(result.answer)} chars")
+                logger.info(f"[SYNTHESIS] Confidence: {result.confidence:.2f}")
+                
                 return result
             else:
                 # 다른 에러는 그대로 전파
                 raise e
     
-    async def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
+    def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """
         노드 실행
         
@@ -288,20 +503,20 @@ Note: Use [{idx}] when citing this document in your answer.
                 if is_retry_from_hallucination:
                     logger.info(f"[SYNTHESIS] Using corrective generation due to hallucination concerns")
                     logger.debug(f"[SYNTHESIS] Hallucination score: {hallucination_feedback.get('score', 0)}")
-                    synthesis_result = await self._generate_corrective_answer(
+                    synthesis_result = self._generate_corrective_answer(
                         query, documents, hallucination_feedback, state.get("metadata", {})
                     )
                 # 품질 체크 실패로 인한 재시도
                 elif is_retry_from_quality:
                     logger.info(f"[SYNTHESIS] Using improved generation due to quality concerns")
                     logger.debug(f"[SYNTHESIS] Quality score: {quality_feedback.get('score', 0)}")
-                    synthesis_result = await self._generate_improved_answer(
+                    synthesis_result = self._generate_improved_answer(
                         query, documents, quality_feedback, state.get("metadata", {})
                     )
             else:
                 # 첫 번째 시도
                 logger.info(f"[SYNTHESIS] Generating answer using {len(documents)} documents...")
-                synthesis_result = await self._generate_answer_with_fallback(query, documents)
+                synthesis_result = self._generate_answer_with_fallback(query, documents)
             logger.info(f"[SYNTHESIS] Answer generated with confidence: {synthesis_result.confidence:.3f}")
             
             # 사용된 소스와 키포인트 상세 정보 로깅
@@ -331,6 +546,26 @@ Note: Use [{idx}] when citing this document in your answer.
                 if "References:" not in final_answer:
                     final_answer = f"{final_answer}\n\n## References:\n{synthesis_result.references_table}"
             
+            # 메시지 생성 - 통합 및 간소화
+            messages = []
+            
+            # 재시도 정보가 있는 경우에만 표시
+            max_retries = int(os.getenv("CRAG_MAX_RETRIES", "3"))
+            if retry_count > 0:
+                retry_reason = ""
+                if is_retry_from_hallucination:
+                    retry_reason = "환각 검증 실패"
+                elif is_retry_from_quality:
+                    retry_reason = "품질 기준 미달"
+                messages.append(
+                    AIMessage(content=f"🔄 답변 재생성 중... (시도 {retry_count+1}/{max_retries}, 사유: {retry_reason})")
+                )
+            
+            # 통합된 답변 생성 메시지
+            messages.append(
+                AIMessage(content=f"✍️ {len(documents)}개 문서에서 답변 생성 중... (신뢰도: {synthesis_result.confidence:.0%})")
+            )
+            
             # 서브태스크 업데이트
             if subtasks and current_idx < len(subtasks):
                 subtasks[current_idx]["answer"] = final_answer
@@ -339,6 +574,7 @@ Note: Use [{idx}] when citing this document in your answer.
                 logger.info(f"[SYNTHESIS] Updated subtask [{subtask_id}] status: 'retrieved' -> 'synthesized'")
                 
                 result = {
+                    "messages": messages,  # 메시지 추가
                     "subtasks": subtasks,
                     "intermediate_answer": final_answer,
                     "confidence_score": synthesis_result.confidence,
@@ -350,6 +586,7 @@ Note: Use [{idx}] when citing this document in your answer.
             else:
                 # 최종 답변
                 result = {
+                    "messages": messages,  # 메시지 추가
                     "final_answer": final_answer,
                     "confidence_score": synthesis_result.confidence,
                     "metadata": metadata,
@@ -369,25 +606,9 @@ Note: Use [{idx}] when citing this document in your answer.
     def invoke(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """동기 실행 (LangGraph 호환성)"""
         logger.debug(f"[SYNTHESIS] Invoke called (sync wrapper)")
-        
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        try:
-            # 이미 실행 중인 이벤트 루프가 있는지 확인
-            loop = asyncio.get_running_loop()
-            logger.debug(f"[SYNTHESIS] Event loop detected, using ThreadPoolExecutor")
-        except RuntimeError:
-            # 이벤트 루프가 없으면 새로 생성하여 실행
-            logger.debug(f"[SYNTHESIS] No event loop, creating new one")
-            return asyncio.run(self.__call__(state))
-        else:
-            # 이미 이벤트 루프가 실행 중이면 별도 스레드에서 실행
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, self.__call__(state))
-                return future.result()
+        return self.__call__(state)
     
-    async def _generate_corrective_answer(self, query: str, documents: List[Document], 
+    def _generate_corrective_answer(self, query: str, documents: List[Document], 
                                          hallucination_feedback: Dict[str, Any], 
                                          metadata: Dict[str, Any]) -> SynthesisResult:
         """
@@ -414,56 +635,93 @@ Note: Use [{idx}] when citing this document in your answer.
         logger.debug(f"[SYNTHESIS] Improvement suggestions: {suggestions}")
         
         # 보수적인 프롬프트 생성
+        # 문제가 된 주장들 포맷팅
+        problematic_claims_text = "\n".join(f'  ✗ {claim}' for claim in problematic_claims) if problematic_claims else '  None identified'
+        supported_claims_text = "\n".join(f'  ✓ {claim}' for claim in supported_claims) if supported_claims else '  None identified'
+        suggestions_text = "\n".join(f'  → {suggestion}' for suggestion in suggestions) if suggestions else '  None provided'
+        
         corrective_prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""CRITICAL: This is a RETRY due to hallucination concerns in the previous attempt.
+            ("system", """CRITICAL: This is a RETRY due to hallucination concerns in the previous attempt.
 
 PREVIOUS ISSUES:
-- Hallucination score: {hallucination_feedback.get('score', 0):.2f}
+- Hallucination score: {hallucination_score:.2f}
 - Problematic claims that MUST BE AVOIDED:
-{chr(10).join(f'  ✗ {claim}' for claim in problematic_claims) if problematic_claims else '  None identified'}
+{problematic_claims}
 
 - Supported claims that CAN BE KEPT:
-{chr(10).join(f'  ✓ {claim}' for claim in supported_claims) if supported_claims else '  None identified'}
+{supported_claims}
 
 - Improvement suggestions:
-{chr(10).join(f'  → {suggestion}' for suggestion in suggestions) if suggestions else '  None provided'}
+{suggestions}
 
 STRICT CORRECTIVE GUIDELINES:
 1. BE EXTREMELY CONSERVATIVE - only state what is EXPLICITLY written in documents
 2. DO NOT make any of the problematic claims listed above
 3. Include reference numbers [1], [2], etc. for EVERY factual statement
-4. If uncertain about ANY detail, explicitly state "문서에 명시되지 않음" or "not specified in documents"
+4. IMPORTANT: When information is not available in documents, explicitly state:
+   - "문서에 해당 정보가 없습니다" (Korean)
+   - "This information is not available in the provided documents" (English)
 5. Prioritize accuracy over completeness - it's better to provide less information that is certain
 6. Use direct quotes when possible, with clear attribution using reference numbers
-7. Clearly distinguish between explicit information and any inferences
+7. Clearly distinguish between:
+   - What IS explicitly stated in documents (use: "문서에 따르면" or "According to the documents")
+   - What is NOT in documents (use: "문서에 명시되지 않음" or "Not specified in documents")
+   - What requires additional information (use: "추가 정보가 필요합니다" or "Additional information needed")
 8. Include a complete References section at the end with all cited documents
 
 ORIGINAL GUIDELINES (with emphasis on accuracy):
-{self.synthesis_prompt.messages[0].prompt.template}"""),
+{template}""".format(
+                hallucination_score=hallucination_feedback.get('score', 0),
+                problematic_claims=problematic_claims_text,
+                supported_claims=supported_claims_text,
+                suggestions=suggestions_text,
+                template=self.synthesis_prompt.messages[0].prompt.template
+            )),
             ("human", """Query: {query}
 
 Retrieved Documents:
 {documents}
 
 Generate a CORRECTED answer that avoids all hallucination issues.
-Be conservative and cite sources explicitly.""")
+Be conservative and cite sources explicitly.
+Clearly state "문서에 정보가 없습니다" or "Information not available in documents" when relevant details are missing.""")
         ])
         
         # 더 낮은 temperature 사용 (보수적 생성)
         conservative_llm = ChatOpenAI(
-            model=self.llm.model_name,
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0.1,  # 매우 낮은 temperature
-            openai_api_key=self.llm.openai_api_key
+            openai_api_key=os.getenv("OPENAI_API_KEY")
         )
         
         # 구조화된 출력으로 답변 생성
-        structured_llm = conservative_llm.with_structured_output(SynthesisResult)
+        structured_llm = conservative_llm.with_structured_output(
+            SynthesisResult
+        )
+        
+        # 페이지 이미지 수집
+        page_images = self._collect_page_images(documents)
         
         # 문서 포맷팅
         formatted_docs = self._format_documents(documents)
         
+        # 페이지 이미지 섹션 추가
+        if page_images:
+            image_section = "\n\n## Page Images Available for Reference:\n"
+            current_source = None
+            
+            for img in page_images:
+                # 소스별로 그룹화
+                if img['source'] != current_source:
+                    current_source = img['source']
+                    image_section += f"\n### From {current_source}:\n"
+                
+                image_section += f"- Page {img['page']}: {img['path']}\n"
+            
+            formatted_docs += image_section
+        
         try:
-            result = await structured_llm.ainvoke(
+            result = structured_llm.invoke(
                 corrective_prompt.format_messages(
                     query=query,
                     documents=formatted_docs
@@ -475,9 +733,9 @@ Be conservative and cite sources explicitly.""")
         except Exception as e:
             logger.error(f"[SYNTHESIS] Corrective generation failed: {str(e)}")
             # Fallback to original method
-            return await self._generate_answer_with_fallback(query, documents)
+            return self._generate_answer_with_fallback(query, documents)
     
-    async def _generate_improved_answer(self, query: str, documents: List[Document],
+    def _generate_improved_answer(self, query: str, documents: List[Document],
                                        quality_feedback: Dict[str, Any],
                                        metadata: Dict[str, Any]) -> SynthesisResult:
         """
@@ -511,24 +769,28 @@ Be conservative and cite sources explicitly.""")
         logger.debug(f"[SYNTHESIS] Improvement suggestions: {suggestions}")
         
         # 품질 개선 프롬프트 생성
+        missing_aspects_text = "\n".join(f'  ✓ {aspect}' for aspect in missing_aspects) if missing_aspects else '  None identified'
+        suggestions_text = "\n".join(f'  → {suggestion}' for suggestion in suggestions) if suggestions else '  None provided'
+        strengths_text = "\n".join(f'  • {strength}' for strength in strengths) if strengths else '  None identified'
+        
         improvement_prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""IMPORTANT: This is a RETRY to improve answer quality based on evaluation feedback.
+            ("system", """IMPORTANT: This is a RETRY to improve answer quality based on evaluation feedback.
 
 PREVIOUS QUALITY ASSESSMENT:
-- Overall score: {quality_feedback.get('score', 0):.2f}
+- Overall score: {score:.2f}
 - Completeness: {completeness:.2f} (35% weight)
 - Relevance: {relevance:.2f} (30% weight)  
 - Clarity: {clarity:.2f} (20% weight)
 - Usefulness: {usefulness:.2f} (15% weight)
 
 MISSING ASPECTS TO ADDRESS:
-{chr(10).join(f'  ✓ {aspect}' for aspect in missing_aspects) if missing_aspects else '  None identified'}
+{missing_aspects_text}
 
 IMPROVEMENT SUGGESTIONS TO IMPLEMENT:
-{chr(10).join(f'  → {suggestion}' for suggestion in suggestions) if suggestions else '  None provided'}
+{suggestions_text}
 
 STRENGTHS TO MAINTAIN:
-{chr(10).join(f'  • {strength}' for strength in strengths) if strengths else '  None identified'}
+{strengths_text}
 
 QUALITY IMPROVEMENT GUIDELINES:
 1. COMPLETENESS: Address ALL missing aspects listed above
@@ -562,7 +824,17 @@ For vehicle manual queries, ensure you include:
 - Complete References section at the end
 
 ORIGINAL GUIDELINES (with emphasis on completeness):
-{self.synthesis_prompt.messages[0].prompt.template}"""),
+{template}""".format(
+                score=quality_feedback.get('score', 0),
+                completeness=completeness,
+                relevance=relevance,
+                clarity=clarity,
+                usefulness=usefulness,
+                missing_aspects_text=missing_aspects_text,
+                suggestions_text=suggestions_text,
+                strengths_text=strengths_text,
+                template=self.synthesis_prompt.messages[0].prompt.template
+            )),
             ("human", """Query: {query}
 
 Retrieved Documents:
@@ -573,13 +845,15 @@ Focus on completeness, structure, and usefulness.""")
         ])
         
         # 구조화된 출력으로 답변 생성
-        structured_llm = self.llm.with_structured_output(SynthesisResult)
+        structured_llm = self.llm.with_structured_output(
+            SynthesisResult
+        )
         
         # 문서 포맷팅
         formatted_docs = self._format_documents(documents)
         
         try:
-            result = await structured_llm.ainvoke(
+            result = structured_llm.invoke(
                 improvement_prompt.format_messages(
                     query=query,
                     documents=formatted_docs
@@ -591,4 +865,4 @@ Focus on completeness, structure, and usefulness.""")
         except Exception as e:
             logger.error(f"[SYNTHESIS] Improved generation failed: {str(e)}")
             # Fallback to original method
-            return await self._generate_answer_with_fallback(query, documents)
+            return self._generate_answer_with_fallback(query, documents)

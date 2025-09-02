@@ -12,6 +12,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.errors import GraphRecursionError
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -81,7 +82,7 @@ from workflow.tools.tavily_search import TavilySearchTool
 try:
     from workflow.nodes.query_router import QueryRouterNode
     from workflow.nodes.direct_response import DirectResponseNode
-    from workflow.nodes.context_enhancement import ContextEnhancementNode
+    # ContextEnhancementNode removed - using MessagesState for chat history
     ROUTING_AVAILABLE = True
 except ImportError:
     logger.warning("Query routing nodes not found. Running in legacy mode.")
@@ -106,7 +107,7 @@ class MVPWorkflowGraph:
             # 새로운 노드들 초기화
             self.query_router = QueryRouterNode()
             self.direct_response = DirectResponseNode()
-            self.context_enhancement = ContextEnhancementNode()
+            # ContextEnhancement removed - chat history flows through MessagesState
         else:
             logger.info("Query routing disabled, using legacy mode")
         
@@ -158,22 +159,19 @@ class MVPWorkflowGraph:
             # 새로운 노드들 추가
             workflow.add_node("query_router", self.query_router.invoke)
             workflow.add_node("direct_response", self.direct_response.invoke)
-            workflow.add_node("context_enhancement", self.context_enhancement.invoke)
+            # context_enhancement node removed
             
             # 엔트리포인트를 query_router로 설정
             workflow.set_entry_point("query_router")
             
-            # Query Router에서의 조건부 라우팅
+            # Query Router에서의 조건부 라우팅 (simplified)
             def route_query(state: MVPWorkflowState) -> str:
-                """쿼리 타입에 따른 라우팅"""
+                """쿼리 타입에 따른 라우팅 (simple or rag_required only)"""
                 query_type = state.get("query_type", "rag_required")
                 
                 if query_type == "simple":
                     logger.info(f"[ROUTING] Simple query → DirectResponse")
                     return "direct_response"
-                elif query_type == "history_required":
-                    logger.info(f"[ROUTING] History required → ContextEnhancement")
-                    return "context_enhancement"
                 else:  # rag_required
                     logger.info(f"[ROUTING] RAG required → Planning")
                     return "planning"
@@ -183,7 +181,6 @@ class MVPWorkflowGraph:
                 route_query,
                 {
                     "direct_response": "direct_response",
-                    "context_enhancement": "context_enhancement",
                     "planning": "planning"
                 }
             )
@@ -191,8 +188,7 @@ class MVPWorkflowGraph:
             # Direct Response는 바로 종료
             workflow.add_edge("direct_response", END)
             
-            # Context Enhancement는 Planning으로
-            workflow.add_edge("context_enhancement", "planning")
+            # Context Enhancement removed - using MessagesState
         else:
             # === Query Routing이 비활성화된 경우 (기존 동작) ===
             workflow.set_entry_point("planning")
@@ -448,7 +444,34 @@ class MVPWorkflowGraph:
             metadata["web_search_results"] = len(web_documents)
             logger.debug(f"[WEB_SEARCH] Updated metadata")
             
+            # 메시지 생성 - 웹 검색 과정 상세 정보
+            messages = []
+            
+            # 1. 웹 검색 시작
+            messages.append(
+                AIMessage(content=f"🌐 웹 검색 시작: '{query[:100]}...'")
+            )
+            
+            # 2. 검색 진행
+            messages.append(
+                AIMessage(content="🔍 Tavily API로 최신 정보 검색 중...")
+            )
+            
+            # 3. 검색 결과
+            if len(web_documents) > 0:
+                messages.append(
+                    AIMessage(content=f"📄 {len(web_documents)}개 웹 문서 발견")
+                )
+                messages.append(
+                    AIMessage(content=f"✅ 총 {len(all_documents)}개 문서로 보강 완료 (기존 {len(existing_docs)}개 + 웹 {len(web_documents)}개)")
+                )
+            else:
+                messages.append(
+                    AIMessage(content="⚠️ 웹 검색 결과가 없습니다")
+                )
+            
             result = {
+                "messages": messages,  # 메시지 추가
                 "documents": all_documents,
                 "metadata": metadata
             }

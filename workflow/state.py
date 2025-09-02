@@ -9,6 +9,34 @@ from langchain_core.documents import Document
 from langgraph.graph import MessagesState
 
 
+def clearable_add(existing: List[Any], new: List[Any]) -> List[Any]:
+    """
+    Custom reducer that supports both adding and clearing documents.
+    
+    - 빈 리스트 [] 받으면: 전체 초기화 (multi-turn 대화에서 새 RAG 쿼리 시작)
+    - 일반 리스트 받으면: 기존 리스트에 추가 (retrieval 결과 누적)
+    
+    Args:
+        existing: 현재 state의 문서 리스트
+        new: 새로 추가할 문서 리스트
+        
+    Returns:
+        병합된 문서 리스트 (빈 리스트 시 초기화)
+    """
+    if new is None:
+        return existing if existing else []
+    
+    # 특별한 경우: 빈 리스트는 초기화 신호 (multi-turn 대화 새 RAG 시작)
+    if isinstance(new, list) and len(new) == 0:
+        return []
+    
+    # 일반적인 경우: 추가 (retrieval 결과 누적)
+    if existing is None:
+        return new if isinstance(new, list) else []
+    
+    return existing + (new if isinstance(new, list) else [])
+
+
 class MVPWorkflowState(MessagesState):
     """
     MVP 워크플로우 상태
@@ -30,7 +58,7 @@ class MVPWorkflowState(MessagesState):
     query_variations: List[str]                   # 현재 서브태스크의 쿼리 변형 목록
     
     # ===== 검색 관련 필드 =====
-    documents: Annotated[List[Document], add]     # 검색된 문서들 (누적)
+    documents: Annotated[List[Document], clearable_add]  # 검색된 문서들 (누적, multi-turn 시 초기화 가능)
     search_filter: Optional[Dict[str, Any]]       # 현재 검색 필터 설정
     search_language: str                          # 검색 언어 ('korean' 또는 'english')
     

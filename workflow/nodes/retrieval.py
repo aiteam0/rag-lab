@@ -5,19 +5,17 @@ Phase 1의 하이브리드 검색 시스템과 연동하여 문서를 검색하�
 """
 
 import os
-import asyncio
 import logging
 from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import time
-import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 from workflow.state import MVPWorkflowState, SearchResult
 from ingest.database import DatabaseManager
@@ -35,6 +33,16 @@ class LanguageDetection(BaseModel):
     language: str = Field(description="Detected language: 'korean' or 'english'")
     confidence: float = Field(description="Detection confidence (0.0-1.0)")
     reason: str = Field(description="Reason for detection")
+
+
+class RerankResult(BaseModel):
+    """문서 재순위화 결과"""
+    ranked_doc_ids: List[str] = Field(
+        description="문서 ID 리스트 (관련성 높은 순서)"
+    )
+    reasoning: str = Field(
+        description="순위 결정 이유"
+    )
 
 
 class RetrievalNode:
@@ -75,15 +83,16 @@ Examples:
         self.default_top_k = int(os.getenv("SEARCH_DEFAULT_TOP_K", "10"))
         self.max_results = int(os.getenv("SEARCH_MAX_RESULTS", "20"))
         
-    async def _initialize(self):
-        """비동기 초기화 (한 번만 실행)"""
+    
+    def _initialize(self):
+        """동기 초기화 (한 번만 실행)"""
         if not self.initialized:
             self.db_manager = DatabaseManager()
-            await self.db_manager.initialize()
+            self.db_manager.initialize()
             self.hybrid_search = HybridSearch(self.db_manager.pool)
             self.initialized = True
     
-    async def _detect_language(self, query: str) -> LanguageDetection:
+    def _detect_language(self, query: str) -> LanguageDetection:
         """
         쿼리 언어 감지
         
@@ -93,15 +102,17 @@ Examples:
         Returns:
             언어 감지 결과
         """
-        structured_llm = self.llm.with_structured_output(LanguageDetection)
+        structured_llm = self.llm.with_structured_output(
+            LanguageDetection
+        )
         
-        result = await structured_llm.ainvoke(
+        result = structured_llm.invoke(
             self.language_detection_prompt.format_messages(query=query)
         )
         
         return result
     
-    async def _dual_search_strategy(
+    def _dual_search_strategy(
         self,
         query: str,
         filter_dict: Optional[Dict],
@@ -140,7 +151,7 @@ Examples:
         # 1. 일반 필터로 검색 (Entity 없이)
         general_filter = MVPSearchFilter(**general_filter_dict) if general_filter_dict else MVPSearchFilter()
         
-        general_results = await self.hybrid_search.search(
+        general_results = self.hybrid_search.search(
             query=query,
             filter=general_filter,
             language=language,
@@ -162,7 +173,7 @@ Examples:
             
             entity_search_filter = MVPSearchFilter(**entity_filter_dict)
             
-            entity_results = await self.hybrid_search.search(
+            entity_results = self.hybrid_search.search(
                 query=query,
                 filter=entity_search_filter,
                 language=language,
@@ -178,7 +189,7 @@ Examples:
         
         return all_documents[:top_k]  # 최대 top_k개만 반환
     
-    async def _bilingual_search(
+    def _bilingual_search(
         self,
         query: str,
         filter_dict: Optional[Dict],
@@ -202,7 +213,7 @@ Examples:
         """
         # 감지된 언어로만 검색 (이중 언어 검색 제거)
         # 한국어 쿼리는 한국어로만, 영어 쿼리는 영어로만 검색
-        results = await self._dual_search_strategy(
+        results = self._dual_search_strategy(
             query=query,
             filter_dict=filter_dict,
             language=primary_language,
@@ -223,17 +234,39 @@ Examples:
         Returns:
             LangChain Document
         """
+        # source와 page 정보 추출
+        source = result.get("source", "")
+        page = result.get("page", 0)
+        
+        # page_image_path 생성 로직
+        page_image_path = ""
+        if source and page > 0:  # page가 1 이상일 때만
+            # 파일명 추출 (경로와 확장자 제거)
+            # 예: "data/gv80_owners_manual_TEST6P.pdf" → "gv80_owners_manual_TEST6P"
+            filename = os.path.splitext(os.path.basename(source))[0]
+            page_image_path = f"data/images/{filename}-page-{page}.png"
+        
         # 메타데이터 구성
         metadata = {
-            "source": result.get("source", ""),
-            "page": result.get("page", 0),
+            "source": source,
+            "page": page,
             "category": result.get("category", ""),
             "id": result.get("id", ""),
             "caption": result.get("caption", ""),
             "entity": result.get("entity"),
+            "page_image_path": page_image_path,  # 페이지 이미지 경로 추가
             "similarity": result.get("similarity"),
             "rank": result.get("rank"),
-            "rrf_score": result.get("rrf_score")
+            "rrf_score": result.get("rrf_score"),
+            "human_feedback": result.get("human_feedback", ""),  # Human feedback 추가
+            # 통합 score 필드 - None이 아닌 값 우선 (우선순위: rrf > similarity > rank)
+            # RRF는 이미 정규화됨 (0.0-1.0)
+            "score": (
+                result.get("rrf_score") or 
+                result.get("similarity") or 
+                result.get("rank") or 
+                0.0
+            )
         }
         
         # 페이지 콘텐츠 결정 (우선순위: contextualize_text > page_content > translation_text)
@@ -264,19 +297,180 @@ Examples:
         
         confidence = 0.0
         
-        # 유사도 기반
-        similarities = []
+        # 통합 score 기반 신뢰도 계산
+        scores = []
         for doc in documents[:5]:  # 상위 5개만 고려
-            if doc.metadata.get("similarity"):
-                similarities.append(doc.metadata["similarity"])
+            score = doc.metadata.get("score", 0.0)
+            if score and score > 0:
+                scores.append(score)
         
-        if similarities:
-            avg_similarity = sum(similarities) / len(similarities)
-            confidence += avg_similarity
+        if scores:
+            avg_score = sum(scores) / len(scores)
+            confidence += avg_score
 
         return min(confidence, 1.0)
     
-    async def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
+    def _rerank_documents(self, query: str, documents: List[Document], top_k: int = 20) -> List[Document]:
+        """
+        LLM을 사용한 문서 재순위화 - 모든 문서 평가
+        
+        Args:
+            query: 사용자 쿼리
+            documents: 검색된 문서들
+            top_k: 반환할 상위 문서 수
+        
+        Returns:
+            재순위화된 상위 문서들
+        """
+        if len(documents) <= top_k:
+            return documents
+        
+        # 동적 preview 길이 계산 (토큰 제한 고려)
+        # 전체 토큰을 약 50000자로 제한
+        preview_length = min(2000, max(1000, 50000 // len(documents)))
+        logger.info(f"[RERANK] Evaluating {len(documents)} docs with {preview_length} chars preview each")
+        
+        # 모든 문서 요약 생성
+        doc_summaries = []
+        for i, doc in enumerate(documents):
+            summary = {
+                "id": doc.metadata.get("id", f"doc_{i}"),
+                "page": doc.metadata.get("page", 0),
+                "category": doc.metadata.get("category", ""),
+                "content_preview": doc.page_content[:preview_length],  # 동적 길이
+                "score": doc.metadata.get("score", 0)
+            }
+            doc_summaries.append(summary)
+        
+        # Reranking 프롬프트
+        rerank_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a document relevance expert for automotive manuals.
+Your task is to rerank ALL provided documents based on their relevance to the user query.
+
+CRITICAL RULES:
+1. Evaluate ALL documents, not just a subset
+2. Prioritize documents with SPECIFIC information matching the query
+3. Deprioritize generic or vague content
+4. Consider document category (table, figure, heading1 are often important)
+5. Consider original retrieval score as a hint but not absolute
+6. Return ONLY the document IDs WITHOUT brackets or prefixes
+
+IMPORTANT: Return IDs exactly as shown between the brackets in [ID: xxx]
+For example, if you see [ID: doc_0], return "doc_0"
+If you see [ID: gv80_owners_manual_0001], return "gv80_owners_manual_0001"
+DO NOT include "[ID: " or "]" in your response."""),
+            
+            ("human", """Query: {query}
+
+Total documents to evaluate: {doc_count}
+
+Documents:
+{documents}
+
+Return the top {top_k} most relevant document IDs in order.
+Return ONLY the IDs, without any brackets or prefixes.
+Focus on documents that directly answer the query.""")
+        ])
+        
+        # LLM으로 재순위화
+        llm = ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0
+        )
+        
+        structured_llm = llm.with_structured_output(RerankResult)
+        
+        # 문서 텍스트 포맷팅
+        doc_text = "\n".join([
+            f"[ID: {d['id']}] Page {d['page']}, {d['category']}, Score: {d['score']:.2f}\nContent: {d['content_preview']}..."
+            for d in doc_summaries
+        ])
+        
+        result = structured_llm.invoke(
+            rerank_prompt.format_messages(
+                query=query,
+                doc_count=len(documents),
+                documents=doc_text,
+                top_k=top_k
+            )
+        )
+        
+        # 디버깅: LLM이 반환한 ID들 로깅
+        logger.info(f"[RERANK] LLM returned {len(result.ranked_doc_ids)} IDs: {result.ranked_doc_ids[:5]}...")
+        
+        # 재순위화된 문서 반환
+        doc_map = {doc.metadata.get("id", f"doc_{i}"): doc for i, doc in enumerate(documents)}
+        
+        # 디버깅: 실제 문서 ID들 로깅
+        actual_ids = list(doc_map.keys())[:5]
+        logger.info(f"[RERANK] Actual document IDs: {actual_ids}...")
+        
+        reranked_docs = []
+        missing_ids = []
+        
+        for doc_id in result.ranked_doc_ids[:top_k]:
+            if doc_id in doc_map:
+                reranked_docs.append(doc_map[doc_id])
+            else:
+                # ID 매칭 실패 - 다양한 형식 시도
+                # 1. 대괄호 제거
+                cleaned_id = doc_id.strip("[]")
+                if cleaned_id in doc_map:
+                    reranked_docs.append(doc_map[cleaned_id])
+                    continue
+                
+                # 2. "ID: " 프리픽스 제거
+                if doc_id.startswith("ID: "):
+                    cleaned_id = doc_id[4:]
+                    if cleaned_id in doc_map:
+                        reranked_docs.append(doc_map[cleaned_id])
+                        continue
+                
+                # 3. "[ID: " 프리픽스와 "]" 제거
+                if doc_id.startswith("[ID: ") and doc_id.endswith("]"):
+                    cleaned_id = doc_id[5:-1]
+                    if cleaned_id in doc_map:
+                        reranked_docs.append(doc_map[cleaned_id])
+                        continue
+                
+                # 4. 타입 변환 시도 - 문자열을 정수로
+                if isinstance(doc_id, str) and doc_id.isdigit():
+                    int_id = int(doc_id)
+                    if int_id in doc_map:
+                        reranked_docs.append(doc_map[int_id])
+                        continue
+                
+                # 5. 타입 변환 시도 - 정수를 문자열로
+                if isinstance(doc_id, int):
+                    str_id = str(doc_id)
+                    if str_id in doc_map:
+                        reranked_docs.append(doc_map[str_id])
+                        continue
+                
+                # 6. cleaned_id에 대해서도 타입 변환 시도
+                if 'cleaned_id' in locals():
+                    # cleaned_id가 숫자 문자열인 경우 정수로 변환
+                    if isinstance(cleaned_id, str) and cleaned_id.isdigit():
+                        int_cleaned_id = int(cleaned_id)
+                        if int_cleaned_id in doc_map:
+                            reranked_docs.append(doc_map[int_cleaned_id])
+                            continue
+                    # cleaned_id가 정수인 경우 문자열로 변환
+                    elif isinstance(cleaned_id, int):
+                        str_cleaned_id = str(cleaned_id)
+                        if str_cleaned_id in doc_map:
+                            reranked_docs.append(doc_map[str_cleaned_id])
+                            continue
+                
+                missing_ids.append(doc_id)
+        
+        if missing_ids:
+            logger.warning(f"[RERANK] Could not match {len(missing_ids)} IDs: {missing_ids[:3]}...")
+        
+        logger.info(f"[RERANK] {len(documents)} → {len(reranked_docs)} documents (reasoning: {result.reasoning[:100]}...)")
+        return reranked_docs
+    
+    def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """
         노드 실행
         
@@ -288,12 +482,27 @@ Examples:
         """
         logger.info(f"[RETRIEVAL] Node started")
         
+        # Multi-turn 문서 초기화 검증 로직 (첫 번째 subtask에서만)
+        current_subtask_idx = state.get("current_subtask_idx", 0)
+        existing_docs = state.get("documents", [])
+        logger.info(f"[RETRIEVAL] Subtask index: {current_subtask_idx}, Existing documents: {len(existing_docs)}")
+        
+        if current_subtask_idx == 0:  # 첫 번째 subtask 처리 시
+            if len(existing_docs) > 0:
+                logger.warning(f"[RETRIEVAL] Documents not cleared properly: {len(existing_docs)} existing documents found")
+                logger.warning(f"[RETRIEVAL] This may cause multi-turn document accumulation issues")
+                # Log first few document IDs for debugging
+                doc_ids = [doc.metadata.get('id', 'unknown') for doc in existing_docs[:5]]
+                logger.warning(f"[RETRIEVAL] First few document IDs: {doc_ids}")
+            else:
+                logger.info(f"[RETRIEVAL] Document state properly cleared for new RAG query")
+        
         try:
             start_time = time.time()
             
             # 초기화
             logger.debug(f"[RETRIEVAL] Initializing database and search components...")
-            await self._initialize()
+            self._initialize()
             logger.debug(f"[RETRIEVAL] Initialization completed")
             
             # 현재 서브태스크 가져오기
@@ -344,7 +553,7 @@ Examples:
             
             # 기본 언어 감지 (원본 쿼리 기준) - 폴백용
             logger.debug(f"[RETRIEVAL] Detecting language for query: '{query}'")
-            language_detection = await self._detect_language(query)
+            language_detection = self._detect_language(query)
             logger.info(f"[RETRIEVAL] Default language detected: {language_detection.language} (confidence: {language_detection.confidence:.2f})")
             
             # 검색 필터 생성 (state에서 가져오거나 기본값)
@@ -357,53 +566,81 @@ Examples:
             else:
                 logger.info(f"[RETRIEVAL] No search filter (will search all documents)")
             
-            # Multi-Query 병렬 검색 실행 (동시 실행 제한 추가)
+            # Multi-Query 병렬 검색 실행 (병렬성 향상)
             logger.info(f"[RETRIEVAL] Preparing {len(query_variations)} parallel search tasks")
             
-            # Semaphore로 동시 실행 수 제한 (connection pool 고갈 방지)
-            max_concurrent = 1  # 동시에 최대 1개까지만 실행 (database operation conflict 방지)
-            semaphore = asyncio.Semaphore(max_concurrent)
+            # ThreadPoolExecutor로 병렬 실행 (DB pool size의 30%)
+            max_workers = 3  # DB pool이 10개이므로 3개 정도가 적절
             
-            async def limited_search(idx: int, query_variant: str):
-                """Semaphore로 제한된 검색 - 각 쿼리별 개별 언어 감지"""
-                async with semaphore:
+            def search_task(idx: int, query_variant: str):
+                """병렬 검색 태스크 - 각 쿼리별 개별 언어 감지"""
+                try:
                     logger.debug(f"[RETRIEVAL] Executing task {idx}: '{query_variant[:50]}...'")
                     
                     # 각 쿼리 변형별로 개별 언어 감지
-                    variant_language_detection = await self._detect_language(query_variant)
+                    variant_language_detection = self._detect_language(query_variant)
                     logger.info(f"[RETRIEVAL] Task {idx} language: {variant_language_detection.language} (confidence: {variant_language_detection.confidence:.2f}) for query: '{query_variant[:50]}...'")
                     
                     # 감지된 언어로 검색 실행
-                    return await self._bilingual_search(
+                    result = self._bilingual_search(
                         query=query_variant,
                         filter_dict=filter_dict,
                         primary_language=variant_language_detection.language,  # 개별 감지된 언어 사용
                         top_k=self.default_top_k
                     )
+                    return result
+                    
+                except Exception as e:
+                    # 예외를 로깅하고 다시 발생시킴 (executor에서 처리하도록)
+                    error_type = type(e).__name__
+                    logger.error(f"[RETRIEVAL] Task {idx} encountered error: {error_type}: {str(e)}")
+                    raise  # 예외를 다시 발생시켜 executor에서 처리
             
-            # 검색 태스크 파라미터 저장 (coroutine 생성은 실행 시점에)
+            # 검색 태스크 파라미터 저장
             search_tasks = []
             for idx, query_variant in enumerate(query_variations):
                 search_tasks.append((idx, query_variant))  # 파라미터만 저장
             
-            # 모든 검색을 병렬로 실행 (semaphore로 제한됨)
-            logger.info(f"[RETRIEVAL] Executing {len(search_tasks)} searches (max {max_concurrent} concurrent)...")
+            # 모든 검색을 병렬로 실행 (향상된 병렬성)
+            logger.info(f"[RETRIEVAL] Executing {len(search_tasks)} searches (max {max_workers} workers)...")
             
-            # gather with return_exceptions=True - coroutine을 실행 시점에 생성
-            results_or_errors = await asyncio.gather(
-                *[limited_search(idx, query_variant) for idx, query_variant in search_tasks],
-                return_exceptions=True
-            )
+            # ThreadPoolExecutor로 병렬 실행
+            results_or_errors = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(search_task, idx, query_variant) 
+                          for idx, query_variant in search_tasks]
+                
+                for future in futures:
+                    try:
+                        result = future.result()
+                        results_or_errors.append(result)
+                    except Exception as e:
+                        results_or_errors.append(e)
             
-            # Process results and handle errors
+            # Process results and handle errors with better exception handling
             results = []
+            connection_errors = []
+            
             for idx, result_or_error in enumerate(results_or_errors):
                 if isinstance(result_or_error, Exception):
-                    logger.error(f"[RETRIEVAL] Task {idx} failed: {str(result_or_error)}")
+                    error_type = type(result_or_error).__name__
+                    error_msg = str(result_or_error)
+                    
+                    # Connection 관련 에러 특별 처리
+                    if "ConnectionDoesNotExistError" in error_type or "connection" in error_msg.lower():
+                        connection_errors.append(idx)
+                        logger.error(f"[RETRIEVAL] Task {idx} failed with CONNECTION ERROR: {error_msg}")
+                    else:
+                        logger.error(f"[RETRIEVAL] Task {idx} failed with {error_type}: {error_msg}")
+                    
                     results.append([])  # 실패한 변형은 빈 리스트
                 else:
                     logger.debug(f"[RETRIEVAL] Task {idx} succeeded with {len(result_or_error)} documents")
                     results.append(result_or_error)
+            
+            # Connection 에러가 있으면 경고
+            if connection_errors:
+                logger.warning(f"[RETRIEVAL] Connection errors detected in tasks: {connection_errors}. Pool may be corrupted.")
             
             # Log overall status
             successful_tasks = sum(1 for r in results_or_errors if not isinstance(r, Exception))
@@ -422,25 +659,31 @@ Examples:
                 original_filter = filter_dict
                 filter_dict = None  # 필터 제거
                 
-                # Semaphore 재사용하여 제한된 검색 재실행
-                async def retry_limited_search(idx: int, query_variant: str):
+                # 필터 없이 재시도하는 검색 함수
+                def retry_search_task(idx: int, query_variant: str):
                     """필터 없이 재시도하는 검색"""
-                    async with semaphore:
-                        logger.debug(f"[RETRIEVAL] Retrying task {idx} without filter: '{query_variant[:50]}...'")
-                        return await self._bilingual_search(
-                            query=query_variant,
-                            filter_dict=None,  # 필터 없이
-                            primary_language=language_detection.language,
-                            top_k=self.default_top_k
-                        )
+                    logger.debug(f"[RETRIEVAL] Retrying task {idx} without filter: '{query_variant[:50]}...'")
+                    return self._bilingual_search(
+                        query=query_variant,
+                        filter_dict=None,  # 필터 없이
+                        primary_language=language_detection.language,
+                        top_k=self.default_top_k
+                    )
                 
                 logger.info(f"[RETRIEVAL] Retrying {len(search_tasks)} searches without filter...")
                 
-                # 재시도 실행 - coroutine을 실행 시점에 생성
-                retry_results_or_errors = await asyncio.gather(
-                    *[retry_limited_search(idx, query_variant) for idx, query_variant in search_tasks],
-                    return_exceptions=True
-                )
+                # 재시도 실행 (동일한 병렬성 유지)
+                retry_results_or_errors = []
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    retry_futures = [executor.submit(retry_search_task, idx, query_variant) 
+                                   for idx, query_variant in search_tasks]
+                    
+                    for future in retry_futures:
+                        try:
+                            result = future.result()
+                            retry_results_or_errors.append(result)
+                        except Exception as e:
+                            retry_results_or_errors.append(e)
                 
                 # 재시도 결과 처리
                 retry_results = []
@@ -554,8 +797,77 @@ Examples:
             confidence_score = self._calculate_confidence(documents)
             logger.info(f"[RETRIEVAL] Confidence score: {confidence_score:.3f}")
             
+            # Reranking 적용 (문서가 10개 초과시)
+            if len(documents) > 10:
+                logger.info(f"[RETRIEVAL] Applying LLM reranking to {len(documents)} documents...")
+                documents = self._rerank_documents(
+                    query=state["query"],
+                    documents=documents,
+                    top_k=int(os.getenv("RERANK_TOP_K", "10"))
+                )
+                # Reranking 후 메타데이터 업데이트
+                metadata["retrieval"]["documents_after_rerank"] = len(documents)
+                metadata["retrieval"]["reranking_applied"] = True
+                
+                # 현재 서브태스크 문서도 업데이트
+                if subtasks and current_idx < len(subtasks):
+                    subtasks[current_idx]["documents"] = documents
+            else:
+                metadata["retrieval"]["reranking_applied"] = False
+            
+            # 메시지 생성 - 검색 과정 상세 정보
+            messages = []
+            
+            # 1. 서브태스크 정보 (간소화)
+            if subtasks and current_idx < len(subtasks):
+                current_subtask = subtasks[current_idx]
+                subtask_desc = current_subtask.get("description", current_subtask.get("query", ""))
+                messages.append(
+                    AIMessage(content=f"🔎 [{current_idx+1}/{len(subtasks)}] {subtask_desc[:80]}... 검색 중")
+                )
+            else:
+                messages.append(
+                    AIMessage(content=f"🔎 검색 중: {query[:80]}...")
+                )
+            
+            # 언어 감지, 쿼리 변형, 검색 전략 메시지 제거
+            # 필터 정보는 중요한 경우만 표시
+            if filter_dict:
+                # 중요한 필터만 표시 (예: 특정 페이지, 카테고리)
+                important_filters = []
+                if filter_dict.get("page"):
+                    important_filters.append(f"페이지 {filter_dict['page']}")
+                if filter_dict.get("category"):
+                    important_filters.append(f"카테고리 {filter_dict['category']}")
+                if important_filters:
+                    messages.append(
+                        AIMessage(content=f"🔍 필터: {', '.join(important_filters)}")
+                    )
+            
+            # 2. 검색 결과 (관련도 버그 수정)
+            if documents:
+                unique_count = metadata.get("unique_documents", len(documents))
+                # 통합 score 필드 사용 - None 안전 처리
+                scores = [doc.metadata.get("score", 0.0) for doc in documents]
+                valid_scores = [s for s in scores if s and s > 0]  # None과 0 체크
+                
+                if valid_scores:
+                    avg_score = sum(valid_scores) / len(valid_scores)
+                    messages.append(
+                        AIMessage(content=f"📄 {unique_count}개 관련 문서 발견 (평균 유사도: {avg_score:.1%})")
+                    )
+                else:
+                    messages.append(
+                        AIMessage(content=f"📄 {unique_count}개 관련 문서 발견")
+                    )
+            else:
+                messages.append(
+                    AIMessage(content="⚠️ 검색 결과가 없습니다. 웹 검색을 시도합니다...")
+                )
+            
             result = {
-                "documents": documents,  # 누적 추가됨
+                "messages": messages,  # 메시지 추가
+                "documents": documents,  # 문서 반환 (state의 add reducer에 의해 누적됨, planning에서 초기화)
                 "subtasks": subtasks,
                 "search_language": language_detection.language,
                 "confidence_score": confidence_score,
@@ -575,28 +887,13 @@ Examples:
     
     def invoke(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """동기 실행 (LangGraph 호환성)"""
-        logger.debug(f"[RETRIEVAL] Invoke called (sync wrapper)")
+        logger.debug(f"[RETRIEVAL] Invoke called (sync)")
         
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        try:
-            # 이미 실행 중인 이벤트 루프가 있는지 확인
-            loop = asyncio.get_running_loop()
-            logger.debug(f"[RETRIEVAL] Event loop detected, creating task in current loop")
-            # 현재 event loop에서 task 실행 (새 event loop 생성하지 않음)
-            task = loop.create_task(self.__call__(state))
-            # Task를 동기적으로 대기 (nest_asyncio 필요)
-            import nest_asyncio
-            nest_asyncio.apply()
-            return loop.run_until_complete(task)
-        except RuntimeError:
-            # 이벤트 루프가 없으면 새로 생성하여 실행
-            logger.debug(f"[RETRIEVAL] No event loop, creating new one")
-            return asyncio.run(self.__call__(state))
+        # 동기 방식으로 직접 호출
+        return self.__call__(state)
     
-    async def cleanup(self):
+    def cleanup(self):
         """리소스 정리"""
         if self.db_manager:
-            await self.db_manager.close()
+            self.db_manager.close()
             self.initialized = False
