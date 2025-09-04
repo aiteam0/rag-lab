@@ -47,7 +47,7 @@ class DDUFilterGeneration(BaseModel):
     pages: List[int] = Field(default_factory=list, description="Page numbers to filter")
     sources: List[str] = Field(default_factory=list, description="Source files to filter (only if explicitly mentioned)")
     caption: Optional[str] = Field(None, description="Caption text to search")
-    entity: Optional[Dict[str, Any]] = Field(None, description="Entity filter (type must be 'image' or 'table')")
+    entity: Optional[Dict[str, Any]] = Field(None, description="Entity filter (type must be 'image', 'table', or '똑딱이')")
     reasoning: str = Field(default="", description="Reasoning for filter selection")
 
 
@@ -225,10 +225,11 @@ Extract filtering information ONLY if EXPLICITLY mentioned in the query.
 
 STRICT RULES:
 1. Page numbers: ONLY if explicitly stated (e.g., "page 10", "p.45", "50페이지")
-2. Entity type: ONLY 'image' or 'table'. Map similar terms:
+2. Entity type: ONLY 'image', 'table', or '똑딱이'. Map similar terms:
    - 'figure', 'diagram', 'picture', 'illustration', '그림', '사진' → 'image'
    - 'chart', 'graph', '차트', '그래프' → 'image'
    - 'table', 'spreadsheet', '표', '테이블' → 'table'
+   - '똑딱이', '똑딱이 타입', '똑딱이 문서', '참조문서', 'reference', 'appendix', '삽입객체' → '똑딱이'
 3. Source: ONLY if document/manual/guide is EXPLICITLY mentioned
    - Extract source ONLY when these words appear: "매뉴얼", "manual", "guide", "설명서", "문서", "handbook"
    - DO NOT extract source from vehicle model names or product names alone
@@ -257,7 +258,8 @@ STRICT FILTERING RULES:
 DO CREATE FILTER when:
 - Specific page is mentioned: "page 50" → pages: [50]
 - Looking for tables: "show me tables" → entity: {{"type": "table"}} (NOT categories)
-- Looking for images: "엔진 그림" → entity: {{"type": "image"}} (NOT categories) 
+- Looking for images: "엔진 그림" → entity: {{"type": "image"}} (NOT categories)
+- Looking for embedded docs: "똑딱이 문서" or "참조 문서" → entity: {{"type": "똑딱이"}} 
 - Source EXPLICITLY mentioned with document words: "매뉴얼에서", "in the manual" → check available sources
 - Specific category (NOT table/image): "heading" → categories: ["heading1"]
 
@@ -284,9 +286,17 @@ Query: "What are the tire pressure specifications"
 Extraction: {{keywords: ["tire", "pressure", "specifications"]}}
 Filter: {{}} (EMPTY - no specific document or entity type mentioned)
 
+Query: "PPT에 있는 참조문서 보여줘"
+Extraction: {{entity_type: "똑딱이", keywords: []}}
+Filter: {{entity: {{"type": "똑딱이"}}}} (Use entity for embedded documents)
+
 Query: "특정 차량의 엔진 오일 교체 주기"
 Extraction: {{keywords: ["차량", "엔진", "오일", "교체", "주기"]}}
 Filter: {{}} (EMPTY - vehicle model is not a document source)
+
+Query: "똑딱이 문서 알려줘"
+Extraction: {{entity_type: "똑딱이", keywords: []}}
+Filter: {{entity: {{"type": "똑딱이"}}}} (Direct mention of '똑딱이' type)
 
 Remember: LESS IS MORE. Empty filter is better than wrong filter.
 
@@ -296,6 +306,7 @@ IMPORTANT RULES:
 3. NEVER use both 'categories' and 'entity' filters together - use ONLY ONE:
    - For tables: use entity: {{"type": "table"}} (NOT categories: ["table"])
    - For images: use entity: {{"type": "image"}} (NOT categories: ["figure"])
+   - For embedded docs: use entity: {{"type": "똑딱이"}} (NOT categories: ["paragraph"])
    - This avoids overly restrictive filtering
 
 Available entity types: {entity_types}
@@ -352,6 +363,8 @@ Generate MINIMAL filter (prefer empty over wrong):""")
                 pass  # 유지
             elif result.entity_type == 'table' and 'table' in valid_types:
                 pass  # 유지
+            elif result.entity_type == '똑딱이' and '똑딱이' in valid_types:
+                pass  # 유지
             else:
                 result.entity_type = None  # 유효하지 않으면 제거
         
@@ -364,6 +377,18 @@ Generate MINIMAL filter (prefer empty over wrong):""")
         metadata: Dict[str, Any]
     ) -> Optional[MVPSearchFilter]:
         """최소한의 검색 필터 생성"""
+        
+        # 똑딱이 entity_type 강제 필터 생성
+        if extraction.entity_type == '똑딱이' and '똑딱이' in metadata.get("entity_types", []):
+            logger.info(f"[FILTER_OVERRIDE] Forcing '똑딱이' entity filter for query: {query}")
+            return MVPSearchFilter(
+                categories=None,
+                pages=None,
+                sources=None,
+                caption=None,
+                entity={'type': '똑딱이'}
+            )
+        
         structured_llm = self.llm.with_structured_output(
             DDUFilterGeneration,
             method="function_calling"
@@ -380,6 +405,14 @@ Generate MINIMAL filter (prefer empty over wrong):""")
                 sources=sources_str
             )
         )
+        
+        # Debug logging
+        logger.info(f"[FILTER_DEBUG] Query: {query}")
+        logger.info(f"[FILTER_DEBUG] Extraction entity_type: {extraction.entity_type}")
+        logger.info(f"[FILTER_DEBUG] Valid entity_types: {entity_types_str}")
+        logger.info(f"[FILTER_DEBUG] Generated result.entity: {result.entity}")
+        logger.info(f"[FILTER_DEBUG] Generated result.categories: {result.categories}")
+        logger.info(f"[FILTER_DEBUG] Generated result.reasoning: {result.reasoning}")
         
         # Entity type 최종 검증
         valid_types = metadata.get("entity_types", [])

@@ -223,7 +223,8 @@ Create an execution plan with subtasks.""")
                 "metadata": metadata,
                 "workflow_status": "running",
                 "current_node": "planning",
-                "documents": []  # Custom reducer가 빈 리스트를 초기화 신호로 인식
+                "documents": [],  # Custom reducer가 빈 리스트를 초기화 신호로 인식
+                "retry_count": 0  # Reset retry count for new RAG query
             }
             logger.info(f"[PLANNING] Node completed successfully")
             return result

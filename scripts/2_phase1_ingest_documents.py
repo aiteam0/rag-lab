@@ -3,13 +3,12 @@ Document Ingestion Script for MVP RAG System
 Pickle 파일에서 문서를 로드하고 데이터베이스에 저장
 """
 
-import asyncio
 import os
 import sys
 import json
 from pathlib import Path
 from dotenv import load_dotenv
-from tqdm.asyncio import tqdm
+from tqdm import tqdm
 import time
 
 # 프로젝트 루트 경로 추가
@@ -66,7 +65,7 @@ def extract_entity_text(entity_dict: dict) -> str:
     return " ".join(text_parts)
 
 
-async def ingest_documents(pickle_path: str, batch_size: int = 10):
+def ingest_documents(pickle_path: str, batch_size: int = 10):
     """
     DDU 문서 인제스트
     
@@ -110,7 +109,7 @@ async def ingest_documents(pickle_path: str, batch_size: int = 10):
     
     # 데이터베이스 매니저 초기화
     db_manager = DatabaseManager()
-    await db_manager.initialize()
+    db_manager.initialize()
     
     # 임베딩 생성기 초기화
     embeddings = DualLanguageEmbeddings()
@@ -131,8 +130,8 @@ async def ingest_documents(pickle_path: str, batch_size: int = 10):
                 # 문서를 딕셔너리로 변환
                 doc_dict = doc.to_db_dict()
                 
-                # 임베딩 생성
-                korean_emb, english_emb = await embeddings.embed_document(doc_dict)
+                # 임베딩 생성 (동기 버전 사용)
+                korean_emb, english_emb = embeddings.embed_document_sync(doc_dict)
                 
                 # entity 필드를 JSON 문자열로 변환
                 entity_json = None
@@ -148,43 +147,48 @@ async def ingest_documents(pickle_path: str, batch_size: int = 10):
                 if english_emb:
                     english_emb_str = f"[{','.join(map(str, english_emb))}]"
                 
-                # DB 저장
-                async with db_manager.pool.acquire() as conn:
-                    await conn.execute("""
-                        INSERT INTO mvp_ddu_documents (
-                            source, page, category, page_content,
-                            translation_text, contextualize_text, caption,
-                            entity, image_path, human_feedback,
-                            embedding_korean, embedding_english,
-                            search_vector_korean, search_vector_english
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10,
-                                 $11::vector, $12::vector,
-                                 to_tsvector('simple', COALESCE($13, '')),
-                                 to_tsvector('english', COALESCE($14, '')))
-                    """,
-                        doc_dict.get("source"),
-                        doc_dict.get("page"),
-                        doc_dict.get("category"),
-                        doc_dict.get("page_content"),
-                        doc_dict.get("translation_text"),
-                        doc_dict.get("contextualize_text"),
-                        doc_dict.get("caption"),
-                        entity_json,  # JSON 문자열로 변환된 entity
-                        doc_dict.get("image_path"),
-                        doc_dict.get("human_feedback", ""),
-                        korean_emb_str,  # 문자열로 변환된 벡터
-                        english_emb_str,  # 문자열로 변환된 벡터
-                        # 한국어 검색 텍스트 (entity와 human_feedback 포함)
-                        (doc_dict.get("contextualize_text", "") + " " + 
-                         doc_dict.get("page_content", "") + " " +
-                         doc_dict.get("caption", "") + " " +
-                         extract_entity_text(doc_dict.get("entity", {})) + " " +
-                         doc_dict.get("human_feedback", "")),
-                        # 영어 검색 텍스트 (entity와 human_feedback 포함)
-                        (doc_dict.get("translation_text", "") + " " +
-                         extract_entity_text(doc_dict.get("entity", {})) + " " +
-                         doc_dict.get("human_feedback", ""))
-                    )
+                # DB 저장 (psycopg3 패턴 사용)
+                with db_manager.pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO mvp_ddu_documents (
+                                source, page, category, page_content,
+                                translation_text, contextualize_text, caption,
+                                entity, image_path, human_feedback,
+                                embedding_korean, embedding_english,
+                                search_vector_korean, search_vector_english
+                            ) VALUES (%(source)s, %(page)s, %(category)s, %(page_content)s, 
+                                     %(translation_text)s, %(contextualize_text)s, %(caption)s,
+                                     %(entity)s::jsonb, %(image_path)s, %(human_feedback)s,
+                                     %(embedding_korean)s::vector, %(embedding_english)s::vector,
+                                     to_tsvector('simple', COALESCE(%(search_korean)s, '')),
+                                     to_tsvector('english', COALESCE(%(search_english)s, '')))
+                        """,
+                        {
+                            "source": doc_dict.get("source"),
+                            "page": doc_dict.get("page"),
+                            "category": doc_dict.get("category"),
+                            "page_content": doc_dict.get("page_content"),
+                            "translation_text": doc_dict.get("translation_text"),
+                            "contextualize_text": doc_dict.get("contextualize_text"),
+                            "caption": doc_dict.get("caption"),
+                            "entity": entity_json,  # JSON 문자열로 변환된 entity
+                            "image_path": doc_dict.get("image_path"),
+                            "human_feedback": doc_dict.get("human_feedback", ""),
+                            "embedding_korean": korean_emb_str,  # 문자열로 변환된 벡터
+                            "embedding_english": english_emb_str,  # 문자열로 변환된 벡터
+                            # 한국어 검색 텍스트 (entity와 human_feedback 포함)
+                            "search_korean": (doc_dict.get("contextualize_text", "") + " " + 
+                                            doc_dict.get("page_content", "") + " " +
+                                            doc_dict.get("caption", "") + " " +
+                                            extract_entity_text(doc_dict.get("entity", {})) + " " +
+                                            doc_dict.get("human_feedback", "")),
+                            # 영어 검색 텍스트 (entity와 human_feedback 포함)
+                            "search_english": (doc_dict.get("translation_text", "") + " " +
+                                             extract_entity_text(doc_dict.get("entity", {})) + " " +
+                                             doc_dict.get("human_feedback", ""))
+                        })
+                    conn.commit()
                 
                 success_count += 1
                 
@@ -207,17 +211,17 @@ async def ingest_documents(pickle_path: str, batch_size: int = 10):
     
     # DB 통계 확인
     print("\n📊 Final Database Statistics:")
-    stats = await db_manager.get_table_stats()
+    stats = db_manager.get_table_stats()
     print(f"  - Total Documents: {stats['total_documents']}")
     for category, count in list(stats['categories'].items())[:5]:
         print(f"  - {category}: {count} docs")
     
     # 연결 종료
-    await db_manager.close()
+    db_manager.close()
     print("\n✅ Ingestion completed successfully!")
 
 
-async def test_ingestion(pickle_path: str, limit: int = 5):
+def test_ingestion(pickle_path: str, limit: int = 5):
     """
     소수의 문서로 인제스트 테스트
     
@@ -233,7 +237,7 @@ async def test_ingestion(pickle_path: str, limit: int = 5):
     
     # 데이터베이스 매니저 초기화
     db_manager = DatabaseManager()
-    await db_manager.initialize()
+    db_manager.initialize()
     
     # 임베딩 생성기 초기화
     embeddings = DualLanguageEmbeddings()
@@ -245,14 +249,14 @@ async def test_ingestion(pickle_path: str, limit: int = 5):
         print(f"  - Category: {doc.category}")
         print(f"  - Content Length: {len(doc.page_content or '')} chars")
         
-        # 임베딩 생성
+        # 임베딩 생성 (동기 버전 사용)
         doc_dict = doc.to_db_dict()
-        korean_emb, english_emb = await embeddings.embed_document(doc_dict)
+        korean_emb, english_emb = embeddings.embed_document_sync(doc_dict)
         
         print(f"  - Korean Embedding: {'✅' if korean_emb else '❌'}")
         print(f"  - English Embedding: {'✅' if english_emb else '❌'}")
     
-    await db_manager.close()
+    db_manager.close()
     print("\n✅ Test completed!")
 
 
@@ -264,7 +268,8 @@ def main():
     
     # 기본 pickle 파일 경로
     #default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/gv80_owners_manual_TEST6P_documents.pkl"
-    default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/merged_ddu_documents.pkl"
+    #default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/merged_ddu_documents.pkl"
+    default_pickle = "/mnt/e/MyProject2/multimodal-rag-wsl-v2/data/transplanted_ddu_documents.pkl"
     
     # Pickle 파일 선택
     if os.path.exists(default_pickle):
@@ -292,9 +297,9 @@ def main():
     if choice == "1":
         batch_size = input("Batch size (default 10): ")
         batch_size = int(batch_size) if batch_size else 10
-        asyncio.run(ingest_documents(pickle_path, batch_size))
+        ingest_documents(pickle_path, batch_size)
     elif choice == "2":
-        asyncio.run(test_ingestion(pickle_path))
+        test_ingestion(pickle_path)
     elif choice == "3":
         print("Exiting...")
     else:

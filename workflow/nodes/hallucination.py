@@ -162,7 +162,25 @@ Document {idx}:
                     doc_text += f"\n- Entity Info: {str(entity)}"
                 else:
                     category = metadata.get('category', '')
-                    if category == 'table' and entity:
+                    entity_type = entity.get('type', '')
+                    
+                    # '똑딱이' 타입 처리
+                    if entity_type == '똑딱이':
+                        doc_text += "\n- PPT Embedded Document (똑딱이):"
+                        title = entity.get('title')
+                        if title and isinstance(title, str):
+                            doc_text += f"\n  Title: {title}"
+                        details = entity.get('details')
+                        if details and isinstance(details, str):
+                            doc_text += f"\n  Details: {details}"
+                        keywords = entity.get('keywords')
+                        if keywords and isinstance(keywords, list):
+                            doc_text += f"\n  Keywords: {', '.join(str(k) for k in keywords)}"
+                        hypothetical_questions = entity.get('hypothetical_questions')
+                        if hypothetical_questions and isinstance(hypothetical_questions, list):
+                            questions_to_show = hypothetical_questions[:3]
+                            doc_text += f"\n  Can Answer: {'; '.join(str(q) for q in questions_to_show)}"
+                    elif category == 'table' and entity:
                         doc_text += "\n- Table Information:"
                         title = entity.get('title')
                         if title and isinstance(title, str):
@@ -192,6 +210,65 @@ Document {idx}:
             formatted.append(doc_text)
         
         return "\n".join(formatted)
+    
+    def _check_entity_mentions(self, answer: str, documents: List[Document]) -> Dict[str, Any]:
+        """
+        답변에서 중요한 entity type들이 언급되었는지 확인
+        
+        Args:
+            answer: 생성된 답변
+            documents: 원본 문서들
+            
+        Returns:
+            entity 언급 체크 결과
+        """
+        # 똑딱이 entity가 있는지 확인
+        has_ddokddak = False
+        ddokddak_titles = []
+        
+        for doc in documents:
+            if not isinstance(doc, Document):
+                continue
+            
+            metadata = doc.metadata or {}
+            entity = metadata.get("entity", {})
+            
+            if isinstance(entity, dict):
+                entity_type = entity.get("type", "")
+                if entity_type == "똑딱이":
+                    has_ddokddak = True
+                    title = entity.get("title", "")
+                    if title and title not in ddokddak_titles:
+                        ddokddak_titles.append(title)
+        
+        # 똑딱이 entity가 있는 경우 답변에서 언급했는지 확인
+        if has_ddokddak:
+            # 답변에서 관련 키워드 언급 여부 확인
+            mention_keywords = ["똑딱이", "PPT", "삽입 문서", "embedded", "프레젠테이션"]
+            mentioned = any(keyword in answer for keyword in mention_keywords)
+            
+            if not mentioned:
+                logger.warning(f"[HALLUCINATION] 똑딱이 entity가 {len(ddokddak_titles)}개 있지만 답변에서 언급되지 않음")
+                logger.warning(f"[HALLUCINATION] 똑딱이 문서 제목: {', '.join(ddokddak_titles)}")
+                
+                return {
+                    "has_special_entity": True,
+                    "entity_mentioned": False,
+                    "missing_entity_type": "똑딱이 (PPT 삽입 문서)",
+                    "entity_titles": ddokddak_titles,
+                    "warning_message": f"문서에 PPT 삽입 문서(똑딱이) {len(ddokddak_titles)}개가 포함되어 있으나 답변에서 언급되지 않았습니다."
+                }
+            else:
+                logger.info(f"[HALLUCINATION] 똑딱이 entity가 적절히 언급됨")
+                return {
+                    "has_special_entity": True,
+                    "entity_mentioned": True,
+                    "entity_type": "똑딱이 (PPT 삽입 문서)"
+                }
+        
+        return {
+            "has_special_entity": False
+        }
     
     def __call__(self, state: MVPWorkflowState) -> Dict[str, Any]:
         """
@@ -290,6 +367,16 @@ Document {idx}:
                 "supported_claims": check_result.supported_claims,
                 "threshold": self.threshold
             }
+            
+            # Entity 언급 체크 (특히 똑딱이)
+            entity_check = self._check_entity_mentions(answer_to_check, documents)
+            if entity_check.get("has_special_entity"):
+                metadata["entity_mention_check"] = entity_check
+                
+                # 똑딱이가 언급되지 않은 경우 경고
+                if not entity_check.get("entity_mentioned", True):
+                    warning_msg = entity_check.get("warning_message", "특수 entity가 답변에서 언급되지 않음")
+                    logger.warning(f"[HALLUCINATION] {warning_msg}")
             
             # 경고 추가 (필요시)
             warnings = []

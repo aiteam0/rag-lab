@@ -40,8 +40,8 @@ TABLE_CATEGORY = ["table"]
 
 
 class EntityInfo(BaseModel):
-    """Entity 정보 (image, table)"""
-    type: str = Field(description="Entity 타입: image, table")
+    """Entity 정보 (image, table, 똑딱이)"""
+    type: str = Field(description="Entity 타입: image, table, 똑딱이")
     title: Optional[str] = Field(None, description="Entity 제목")
     details: Optional[str] = Field(None, description="상세 설명")
     keywords: List[str] = Field(default_factory=list, description="관련 키워드")

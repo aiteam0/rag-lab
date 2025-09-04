@@ -5,7 +5,9 @@ Synthesis Node
 
 import os
 import logging
-from typing import Dict, Any, List
+import time
+import random
+from typing import Dict, Any, List, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
@@ -22,13 +24,30 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+class PageImageInfo(BaseModel):
+    """페이지 이미지 정보"""
+    path: str = Field(description="Image file path")
+    page: int = Field(description="Page number")
+    source: str = Field(description="Source document name")
+
+class EntityReference(BaseModel):
+    """Entity information that was referenced in the answer"""
+    entity_type: str = Field(description="Type: 똑딱이, table, or figure")
+    title: Optional[str] = Field(description="Entity title if available")
+    details: Optional[str] = Field(description="Entity details or description")
+    source_doc: str = Field(description="Source document reference [1], [2], etc.")
+
 class SynthesisResult(BaseModel):
     """답변 생성 결과"""
-    answer: str = Field(description="Generated answer with inline citations [1], [2], etc. MUST end with References table")
+    answer: str = Field(description="Generated answer with inline citations [1], [2], etc. MUST end with References table and page images if available")
     confidence: float = Field(description="Confidence score (0.0-1.0)")
     sources_used: List[str] = Field(description="List of source references used in format: '[1]', '[2]', etc.")
     key_points: List[str] = Field(description="Key points extracted from documents")
     references_table: str = Field(description="MANDATORY References table in format: | 참조번호 | 문서명 | 페이지 | 내용 요약 |")
+    page_images: Optional[List[PageImageInfo]] = Field(default=None, description="Page images from referenced documents")
+    human_feedback_used: Optional[List[str]] = Field(default=None, description="List of human feedback that was incorporated into the answer")
+    entity_references: Optional[List[EntityReference]] = Field(default=None, description="Structured entity information (똑딱이/table/figure) referenced in answer")
+    warnings: Optional[List[str]] = Field(default=None, description="Any warnings or cautions extracted from documents")
 
 
 class SynthesisNode:
@@ -50,28 +69,36 @@ Your task is to generate comprehensive and accurate answers based on the retriev
 
 CRITICAL - Information Priority Hierarchy:
 1. **HIGHEST PRIORITY - Human Verified Content**: If a document has "Human Verified" information, this is the ground truth and should be used as the primary source
-2. **HIGH PRIORITY - Structured Entity Data**: Table and Figure information with titles, details, and keywords provide structured context
+2. **HIGH PRIORITY - Structured Entity Data**: 
+   - **PPT Embedded Documents (똑딱이)**: Special document type with structured metadata from PPT presentations
+   - **Tables**: Structured tabular data with titles, details, and keywords
+   - **Figures**: Visual information with descriptions and contextual data
 3. **STANDARD PRIORITY - Document Content**: Regular document text is the baseline information source
 
 Guidelines:
 1. Base your answer ONLY on the provided documents
 2. When human feedback exists, prioritize it over other sources
-3. When entity information exists (tables/figures), use the structured data to provide precise details
-4. If information is not in the documents, say so clearly
-5. Cite sources using reference numbers [1], [2], etc. in the main text
-6. Structure your answer clearly with proper formatting
-7. **CRITICAL: For Korean documents, preserve the EXACT original terms and expressions**
+3. When entity information exists (tables/figures/똑딱이), use the structured data to provide precise details
+4. **CRITICAL - 똑딱이 Entity Mention**: 
+   - When a document has entity type "똑딱이", ALWAYS mention it's a "PPT 삽입 문서" or "PPT Embedded Document"
+   - Include the document title from entity metadata when available
+   - Mention that this is a specially structured document from PPT presentations
+   - Example: "이 정보는 'PPT 삽입 문서(똑딱이)'인 [제목]에서 확인할 수 있습니다"
+5. If information is not in the documents, say so clearly
+6. Cite sources using reference numbers [1], [2], etc. in the main text
+7. Structure your answer clearly with proper formatting
+8. **CRITICAL: For Korean documents, preserve the EXACT original terms and expressions**
    - Use original Korean terms exactly as written
    - Maintain parenthetical expressions as-is
    - Do NOT paraphrase or reword key terms from the source documents
-8. Include specific details like numbers, procedures, and specifications
-9. If there are conflicting information, human feedback takes precedence
-10. Use the same reference number for the same document throughout the answer
-11. Place reference numbers immediately after the relevant statement
-12. When quoting or referencing policy terms, use the exact wording from the source
+9. Include specific details like numbers, procedures, and specifications
+10. If there are conflicting information, human feedback takes precedence
+11. Use the same reference number for the same document throughout the answer
+12. Place reference numbers immediately after the relevant statement
+13. When quoting or referencing policy terms, use the exact wording from the source
 
 Page Image Display Guidelines:
-13. **IMPORTANT**: If retrieved documents have page images (page_image_path in metadata):
+14. **IMPORTANT**: If retrieved documents have page images (page_image_path in metadata):
     - Collect all unique page images from cited documents
     - Display them at the END of your answer in a dedicated section
     - Group by source document and order by page number
@@ -155,6 +182,56 @@ Extract source filename and page from each document's metadata for proper refere
 Note: Use [{idx}] when citing this document in your answer.
 """
     
+    def _invoke_with_retry(self, structured_llm, messages, max_retries=3):
+        """
+        LLM 호출에 exponential backoff retry 적용
+        
+        Args:
+            structured_llm: with_structured_output()로 래핑된 LLM 인스턴스
+            messages: 프롬프트 메시지
+            max_retries: 최대 재시도 횟수 (기본값: 3)
+            
+        Returns:
+            LLM 응답 결과
+            
+        Raises:
+            Exception: 최대 재시도 후에도 실패한 경우
+        """
+        for attempt in range(max_retries + 1):  # 0부터 max_retries까지
+            try:
+                logger.info(f"[SYNTHESIS] LLM invoke attempt {attempt + 1}/{max_retries + 1}")
+                result = structured_llm.invoke(messages)
+                logger.info(f"[SYNTHESIS] LLM invoke succeeded on attempt {attempt + 1}")
+                return result
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                
+                # OpenAI API 서버 에러인지 확인
+                is_server_error = any(phrase in error_msg for phrase in [
+                    "server had an error",
+                    "internal server error", 
+                    "service unavailable",
+                    "timeout",
+                    "connection error",
+                    "temporarily unavailable"
+                ])
+                
+                if attempt == max_retries:
+                    # 최종 시도에서 실패
+                    logger.error(f"[SYNTHESIS] LLM invoke failed after {max_retries + 1} attempts: {str(e)}")
+                    raise e
+                
+                if is_server_error:
+                    # 서버 에러는 재시도
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)  # 1s, 2s, 4s + jitter
+                    logger.warning(f"[SYNTHESIS] Server error detected (attempt {attempt + 1}): {str(e)}")
+                    logger.info(f"[SYNTHESIS] Retrying in {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    # 서버 에러가 아닌 경우 즉시 실패
+                    logger.error(f"[SYNTHESIS] Non-server error, not retrying: {str(e)}")
+                    raise e
     
     def _format_entity_info(self, metadata: dict) -> str:
         """
@@ -176,9 +253,29 @@ Note: Use [{idx}] when citing this document in your answer.
             return f"- Entity Info: {str(entity)}\n"
         
         category = metadata.get("category", "")
+        entity_type = entity.get("type", "")
+        
+        # '똑딱이' 타입인 경우: PPT 삽입 문서 정보 제공
+        if entity_type == "똑딱이":
+            entity_text = "- PPT Embedded Document (똑딱이):\n"
+            title = entity.get("title")
+            if title and isinstance(title, str):
+                entity_text += f"  Title: {title}\n"
+            details = entity.get("details")
+            if details and isinstance(details, str):
+                entity_text += f"  Details: {details}\n"
+            keywords = entity.get("keywords")
+            if keywords and isinstance(keywords, list):
+                entity_text += f"  Keywords: {', '.join(str(k) for k in keywords)}\n"
+            hypothetical_questions = entity.get("hypothetical_questions")
+            if hypothetical_questions and isinstance(hypothetical_questions, list):
+                # 최대 3개의 질문만 표시
+                questions_to_show = hypothetical_questions[:3]
+                entity_text += f"  Can Answer: {'; '.join(str(q) for q in questions_to_show)}\n"
+            return entity_text.rstrip()
         
         # 테이블인 경우: 구조화된 정보 제공
-        if category == "table" and entity:
+        elif category == "table" and entity:
             entity_text = "- Table: "
             title = entity.get("title")
             if title and isinstance(title, str):
@@ -204,20 +301,41 @@ Note: Use [{idx}] when citing this document in your answer.
         
         return ""
     
-    def _collect_page_images(self, documents: List[Document]) -> List[Dict[str, Any]]:
+    def _collect_page_images(self, documents: List[Document], sources_used: List[str] = None) -> List[Dict[str, Any]]:
         """
         문서들에서 유니크한 페이지 이미지 수집
         
         Args:
             documents: 검색된 문서 리스트
+            sources_used: 실제 인용된 문서 참조 번호 (예: ['[1]', '[2]'])
             
         Returns:
             페이지 이미지 정보를 담은 딕셔너리 리스트
         """
+        # sources_used가 제공되면 해당 문서만 필터링
+        if sources_used:
+            try:
+                # '[1]', '[2]' 형식에서 인덱스 추출 (1-based를 0-based로 변환)
+                used_indices = []
+                for source in sources_used:
+                    # '[1]' -> 1 -> 0 (인덱스)
+                    idx = int(source.strip('[]')) - 1
+                    if 0 <= idx < len(documents):
+                        used_indices.append(idx)
+                
+                # 인용된 인덱스의 문서만 사용
+                filtered_documents = [documents[i] for i in used_indices]
+                logger.info(f"[SYNTHESIS] Filtering page images: {len(documents)} docs → {len(filtered_documents)} cited docs")
+            except (ValueError, IndexError) as e:
+                logger.warning(f"[SYNTHESIS] Error parsing sources_used: {e}, using all documents")
+                filtered_documents = documents
+        else:
+            filtered_documents = documents
+        
         page_images = []
         seen_paths = set()
         
-        for doc in documents:
+        for doc in filtered_documents:
             if not isinstance(doc, Document):
                 continue
                 
@@ -243,6 +361,101 @@ Note: Use [{idx}] when citing this document in your answer.
         page_images.sort(key=lambda x: (x["source"], x["page"]))
         
         return page_images
+    
+    def _collect_entity_references(self, documents: List[Document], doc_idx_map: Dict[int, str]) -> List[EntityReference]:
+        """
+        문서들에서 entity 정보 수집 (똑딱이, table, figure)
+        
+        Args:
+            documents: 검색된 문서 리스트
+            doc_idx_map: 문서 인덱스 to 참조번호 매핑 (e.g., {0: '[1]', 1: '[2]'})
+            
+        Returns:
+            EntityReference 리스트
+        """
+        entity_refs = []
+        
+        for idx, doc in enumerate(documents):
+            if not isinstance(doc, Document):
+                continue
+                
+            metadata = doc.metadata or {}
+            entity = metadata.get("entity")
+            category = metadata.get("category", "")
+            
+            # entity가 존재하고 dictionary인 경우만 처리
+            if entity and isinstance(entity, dict):
+                entity_type = entity.get("type", "")
+                
+                # 똑딱이, table, figure 중 하나인 경우
+                if entity_type == "똑딱이" or category in ["table", "figure"]:
+                    ref = EntityReference(
+                        entity_type=entity_type if entity_type == "똑딱이" else category,
+                        title=entity.get("title") if isinstance(entity.get("title"), str) else None,
+                        details=entity.get("details") if isinstance(entity.get("details"), str) else None,
+                        source_doc=doc_idx_map.get(idx, f"[{idx+1}]")
+                    )
+                    entity_refs.append(ref)
+        
+        return entity_refs
+    
+    def _collect_human_feedback(self, documents: List[Document]) -> List[str]:
+        """
+        문서들에서 human feedback 수집
+        
+        Args:
+            documents: 검색된 문서 리스트
+            
+        Returns:
+            Human feedback 문자열 리스트
+        """
+        feedback_list = []
+        
+        for doc in documents:
+            if not isinstance(doc, Document):
+                continue
+                
+            metadata = doc.metadata or {}
+            human_feedback = metadata.get("human_feedback")
+            
+            # human_feedback가 존재하고 비어있지 않은 경우
+            if human_feedback and isinstance(human_feedback, str) and human_feedback.strip():
+                feedback_list.append(human_feedback.strip())
+        
+        return feedback_list
+    
+    def _extract_warnings(self, documents: List[Document]) -> List[str]:
+        """
+        문서 내용에서 경고/주의사항 추출
+        
+        Args:
+            documents: 검색된 문서 리스트
+            
+        Returns:
+            경고/주의사항 문자열 리스트
+        """
+        warnings = []
+        warning_keywords = ["경고", "주의", "위험", "warning", "caution", "danger", "주의사항", "안전"]
+        
+        for doc in documents:
+            if not isinstance(doc, Document):
+                continue
+                
+            content = doc.page_content.lower()
+            
+            # 경고 키워드가 포함된 문장 찾기
+            for keyword in warning_keywords:
+                if keyword in content.lower():
+                    # 간단한 휴리스틱: 키워드 주변 문장 추출
+                    sentences = doc.page_content.split('.')
+                    for sentence in sentences:
+                        if keyword in sentence.lower() and len(sentence.strip()) > 10:
+                            warning_text = sentence.strip()
+                            if warning_text not in warnings:  # 중복 제거
+                                warnings.append(warning_text)
+                            break  # 한 문서에서 하나의 경고만 추출
+        
+        return warnings[:5]  # 최대 5개까지만 반환 (너무 많은 경고 방지)
     
     def _format_documents(self, documents: List[Document], truncate: bool = False) -> str:
         """
@@ -322,6 +535,17 @@ Note: Use [{idx}] when citing this document in your answer.
                 human_feedback=human_feedback_text,
                 page_image_note=page_image_note
             )
+            
+            # "똑딱이" entity type을 더 명확하게 강조
+            if entity_info_text and "똑딱이" in entity_info_text:
+                # PPT Embedded Document를 시각적으로 강조
+                formatted_doc = formatted_doc.replace(
+                    "- PPT Embedded Document (똑딱이):",
+                    "- **[SPECIAL] PPT Embedded Document (똑딱이)**:"
+                )
+                # 문서 시작 부분에 특별 표시 추가
+                formatted_doc = f"[📌 PPT 삽입 문서]\n{formatted_doc}"
+            
             formatted_docs.append(formatted_doc)
         
         return "\n".join(formatted_docs)
@@ -341,38 +565,81 @@ Note: Use [{idx}] when citing this document in your answer.
         Returns:
             생성된 답변 결과
         """
-        # 페이지 이미지 수집
-        page_images = self._collect_page_images(documents)
-        
         # 먼저 전체 문서로 시도
         try:
             formatted_docs = self._format_documents(documents, truncate=False)
-            
-            # 페이지 이미지 섹션 추가
-            if page_images:
-                image_section = "\n\n## Page Images Available for Reference:\n"
-                current_source = None
-                
-                for img in page_images:
-                    # 소스별로 그룹화
-                    if img['source'] != current_source:
-                        current_source = img['source']
-                        image_section += f"\n### From {current_source}:\n"
-                    
-                    image_section += f"- Page {img['page']}: {img['path']}\n"
-                
-                formatted_docs += image_section
             
             structured_llm = self.llm.with_structured_output(
                 SynthesisResult
             )
             
-            result = structured_llm.invoke(
+            result = self._invoke_with_retry(
+                structured_llm,
                 self.synthesis_prompt.format_messages(
                     query=query,
                     documents=formatted_docs
                 )
             )
+            
+            # sources_used를 기반으로 인용된 문서의 페이지 이미지만 수집
+            page_images = self._collect_page_images(documents, sources_used=result.sources_used)
+            
+            # 페이지 이미지를 답변에 추가 및 page_images 필드 설정
+            if page_images:
+                # PageImageInfo 객체 리스트 생성
+                page_image_infos = []
+                for img in page_images:
+                    page_image_infos.append(PageImageInfo(
+                        path=img['path'],
+                        page=img['page'],
+                        source=img['source']
+                    ))
+                result.page_images = page_image_infos
+                
+                # 답변 텍스트에 접을 수 있는 이미지 섹션 추가
+                image_count = len(page_images)
+                image_section = "\n\n## 📎 참조 페이지 이미지\n"
+                image_section += f"### 📄 페이지 이미지 ({image_count}개)\n\n"
+                
+                current_source = None
+                for img in page_images:
+                    if img['source'] != current_source:
+                        current_source = img['source']
+                        image_section += f"\n### 📄 {current_source}\n"
+                    
+                    image_section += f"![Page {img['page']}]({img['path']})\n"
+                
+                # 이미지 섹션 완료
+                
+                # 답변에 이미지 섹션 추가
+                result.answer = result.answer + image_section
+                logger.info(f"[SYNTHESIS] Added {len(page_images)} page images from cited documents to answer")
+            
+            # 새로운 필드 수집 및 설정
+            # 1. Human feedback 수집
+            human_feedback = self._collect_human_feedback(documents)
+            if human_feedback:
+                result.human_feedback_used = human_feedback
+                logger.info(f"[SYNTHESIS] Found {len(human_feedback)} human feedback entries")
+            
+            # 2. Entity references 수집
+            # 문서 인덱스 to 참조번호 매핑 생성
+            doc_idx_map = {}
+            for idx in range(len(documents)):
+                doc_idx_map[idx] = f"[{idx+1}]"
+            
+            entity_refs = self._collect_entity_references(documents, doc_idx_map)
+            if entity_refs:
+                result.entity_references = entity_refs
+                logger.info(f"[SYNTHESIS] Found {len(entity_refs)} entity references")
+                for ref in entity_refs[:3]:  # 처음 3개만 로깅
+                    logger.info(f"[SYNTHESIS]   - {ref.entity_type}: {ref.title}")
+            
+            # 3. 경고사항 추출
+            warnings = self._extract_warnings(documents)
+            if warnings:
+                result.warnings = warnings
+                logger.info(f"[SYNTHESIS] Extracted {len(warnings)} warnings")
             
             # 생성된 답변 로깅
             logger.info(f"[SYNTHESIS] === Generated Answer Summary ===")
@@ -397,31 +664,73 @@ Note: Use [{idx}] when citing this document in your answer.
                 # 문서 축약하여 재시도
                 formatted_docs = self._format_documents(documents, truncate=True)
                 
-                # 페이지 이미지 섹션 추가 (truncate에서도 동일하게)
-                if page_images:
-                    image_section = "\n\n## Page Images Available for Reference:\n"
-                    current_source = None
-                    
-                    for img in page_images:
-                        # 소스별로 그룹화
-                        if img['source'] != current_source:
-                            current_source = img['source']
-                            image_section += f"\n### From {current_source}:\n"
-                        
-                        image_section += f"- Page {img['page']}: {img['path']}\n"
-                    
-                    formatted_docs += image_section
-                
                 structured_llm = self.llm.with_structured_output(
                     SynthesisResult
                 )
                 
-                result = structured_llm.invoke(
+                result = self._invoke_with_retry(
+                    structured_llm,
                     self.synthesis_prompt.format_messages(
                         query=query,
                         documents=formatted_docs
                     )
                 )
+                
+                # Fallback에서도 sources_used를 기반으로 인용된 문서의 페이지 이미지만 수집
+                page_images = self._collect_page_images(documents, sources_used=result.sources_used)
+                
+                if page_images:
+                    # PageImageInfo 객체 리스트 생성
+                    page_image_infos = []
+                    for img in page_images:
+                        page_image_infos.append(PageImageInfo(
+                            path=img['path'],
+                            page=img['page'],
+                            source=img['source']
+                        ))
+                    result.page_images = page_image_infos
+                    
+                    # 답변 텍스트에 접을 수 있는 이미지 섹션 추가
+                    image_count = len(page_images)
+                    image_section = "\n\n## 📎 참조 페이지 이미지\n"
+                    image_section += f"### 📄 페이지 이미지 ({image_count}개)\n\n"
+                    
+                    current_source = None
+                    for img in page_images:
+                        if img['source'] != current_source:
+                            current_source = img['source']
+                            image_section += f"\n### 📄 {current_source}\n"
+                        
+                        image_section += f"![Page {img['page']}]({img['path']})\n"
+                    
+                    # 이미지 섹션 완료
+                    
+                    # 답변에 이미지 섹션 추가
+                    result.answer = result.answer + image_section
+                    logger.info(f"[SYNTHESIS] Added {len(page_images)} page images from cited documents to answer (fallback)")
+                
+                # Fallback에서도 새로운 필드 수집 및 설정
+                # 1. Human feedback 수집
+                human_feedback = self._collect_human_feedback(documents)
+                if human_feedback:
+                    result.human_feedback_used = human_feedback
+                    logger.info(f"[SYNTHESIS-FALLBACK] Found {len(human_feedback)} human feedback entries")
+                
+                # 2. Entity references 수집
+                doc_idx_map = {}
+                for idx in range(len(documents)):
+                    doc_idx_map[idx] = f"[{idx+1}]"
+                
+                entity_refs = self._collect_entity_references(documents, doc_idx_map)
+                if entity_refs:
+                    result.entity_references = entity_refs
+                    logger.info(f"[SYNTHESIS-FALLBACK] Found {len(entity_refs)} entity references")
+                
+                # 3. 경고사항 추출
+                warnings = self._extract_warnings(documents)
+                if warnings:
+                    result.warnings = warnings
+                    logger.info(f"[SYNTHESIS-FALLBACK] Extracted {len(warnings)} warnings")
                 
                 # Fallback 시에도 답변 로깅
                 logger.warning(f"[SYNTHESIS] Generated answer using truncated documents (fallback)")
@@ -699,34 +1008,75 @@ Clearly state "문서에 정보가 없습니다" or "Information not available i
             SynthesisResult
         )
         
-        # 페이지 이미지 수집
-        page_images = self._collect_page_images(documents)
-        
         # 문서 포맷팅
         formatted_docs = self._format_documents(documents)
         
-        # 페이지 이미지 섹션 추가
-        if page_images:
-            image_section = "\n\n## Page Images Available for Reference:\n"
-            current_source = None
-            
-            for img in page_images:
-                # 소스별로 그룹화
-                if img['source'] != current_source:
-                    current_source = img['source']
-                    image_section += f"\n### From {current_source}:\n"
-                
-                image_section += f"- Page {img['page']}: {img['path']}\n"
-            
-            formatted_docs += image_section
-        
         try:
-            result = structured_llm.invoke(
+            result = self._invoke_with_retry(
+                structured_llm,
                 corrective_prompt.format_messages(
                     query=query,
                     documents=formatted_docs
                 )
             )
+            
+            # sources_used를 기반으로 인용된 문서의 페이지 이미지만 수집
+            page_images = self._collect_page_images(documents, sources_used=result.sources_used)
+            
+            # 페이지 이미지를 답변에 추가 및 page_images 필드 설정
+            if page_images:
+                # PageImageInfo 객체 리스트 생성
+                page_image_infos = []
+                for img in page_images:
+                    page_image_infos.append(PageImageInfo(
+                        path=img['path'],
+                        page=img['page'],
+                        source=img['source']
+                    ))
+                result.page_images = page_image_infos
+                
+                # 답변 텍스트에 접을 수 있는 이미지 섹션 추가
+                image_count = len(page_images)
+                image_section = "\n\n## 📎 참조 페이지 이미지\n"
+                image_section += f"### 📄 페이지 이미지 ({image_count}개)\n\n"
+                
+                current_source = None
+                for img in page_images:
+                    if img['source'] != current_source:
+                        current_source = img['source']
+                        image_section += f"\n### 📄 {current_source}\n"
+                    
+                    image_section += f"![Page {img['page']}]({img['path']})\n"
+                
+                # 이미지 섹션 완료
+                
+                # 답변에 이미지 섹션 추가
+                result.answer = result.answer + image_section
+                logger.info(f"[SYNTHESIS] Added {len(page_images)} page images from cited documents to corrective answer")
+            
+            # 새로운 필드 수집 및 설정 (corrective answer에서도 동일하게)
+            # 1. Human feedback 수집
+            human_feedback = self._collect_human_feedback(documents)
+            if human_feedback:
+                result.human_feedback_used = human_feedback
+                logger.info(f"[SYNTHESIS-CORRECTIVE] Found {len(human_feedback)} human feedback entries")
+            
+            # 2. Entity references 수집
+            doc_idx_map = {}
+            for idx in range(len(documents)):
+                doc_idx_map[idx] = f"[{idx+1}]"
+            
+            entity_refs = self._collect_entity_references(documents, doc_idx_map)
+            if entity_refs:
+                result.entity_references = entity_refs
+                logger.info(f"[SYNTHESIS-CORRECTIVE] Found {len(entity_refs)} entity references")
+            
+            # 3. 경고사항 추출
+            warnings = self._extract_warnings(documents)
+            if warnings:
+                result.warnings = warnings
+                logger.info(f"[SYNTHESIS-CORRECTIVE] Extracted {len(warnings)} warnings")
+            
             logger.info(f"[SYNTHESIS] Corrective answer generated successfully")
             return result
             
@@ -853,12 +1203,71 @@ Focus on completeness, structure, and usefulness.""")
         formatted_docs = self._format_documents(documents)
         
         try:
-            result = structured_llm.invoke(
+            result = self._invoke_with_retry(
+                structured_llm,
                 improvement_prompt.format_messages(
                     query=query,
                     documents=formatted_docs
                 )
             )
+            
+            # sources_used를 기반으로 인용된 문서의 페이지 이미지만 수집
+            page_images = self._collect_page_images(documents, sources_used=result.sources_used)
+            
+            # 페이지 이미지를 답변에 추가 및 page_images 필드 설정
+            if page_images:
+                # PageImageInfo 객체 리스트 생성
+                page_image_infos = []
+                for img in page_images:
+                    page_image_infos.append(PageImageInfo(
+                        path=img['path'],
+                        page=img['page'],
+                        source=img['source']
+                    ))
+                result.page_images = page_image_infos
+                
+                # 답변 텍스트에 접을 수 있는 이미지 섹션 추가
+                image_count = len(page_images)
+                image_section = "\n\n## 📎 참조 페이지 이미지\n"
+                image_section += f"### 📄 페이지 이미지 ({image_count}개)\n\n"
+                
+                current_source = None
+                for img in page_images:
+                    if img['source'] != current_source:
+                        current_source = img['source']
+                        image_section += f"\n### 📄 {current_source}\n"
+                    
+                    image_section += f"![Page {img['page']}]({img['path']})\n"
+                
+                # 이미지 섹션 완료
+                
+                # 답변에 이미지 섹션 추가
+                result.answer = result.answer + image_section
+                logger.info(f"[SYNTHESIS] Added {len(page_images)} page images from cited documents to improved answer")
+            
+            # 새로운 필드 수집 및 설정 (improved answer에서도 동일하게)
+            # 1. Human feedback 수집
+            human_feedback = self._collect_human_feedback(documents)
+            if human_feedback:
+                result.human_feedback_used = human_feedback
+                logger.info(f"[SYNTHESIS-IMPROVED] Found {len(human_feedback)} human feedback entries")
+            
+            # 2. Entity references 수집
+            doc_idx_map = {}
+            for idx in range(len(documents)):
+                doc_idx_map[idx] = f"[{idx+1}]"
+            
+            entity_refs = self._collect_entity_references(documents, doc_idx_map)
+            if entity_refs:
+                result.entity_references = entity_refs
+                logger.info(f"[SYNTHESIS-IMPROVED] Found {len(entity_refs)} entity references")
+            
+            # 3. 경고사항 추출
+            warnings = self._extract_warnings(documents)
+            if warnings:
+                result.warnings = warnings
+                logger.info(f"[SYNTHESIS-IMPROVED] Extracted {len(warnings)} warnings")
+            
             logger.info(f"[SYNTHESIS] Improved answer generated successfully")
             return result
             

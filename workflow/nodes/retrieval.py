@@ -148,28 +148,13 @@ Examples:
             # entity를 제외한 나머지 필터만 복사
             general_filter_dict = {k: v for k, v in filter_dict.items() if k != "entity"}
         
-        # 1. 일반 필터로 검색 (Entity 없이)
-        general_filter = MVPSearchFilter(**general_filter_dict) if general_filter_dict else MVPSearchFilter()
-        
-        general_results = self.hybrid_search.search(
-            query=query,
-            filter=general_filter,
-            language=language,
-            top_k=top_k
-        )
-        
-        # 결과를 Document로 변환하고 중복 체크
-        for result in general_results:
-            doc_id = result.get("id")
-            if doc_id and doc_id not in seen_ids:
-                seen_ids.add(doc_id)
-                all_documents.append(self._convert_to_document(result))
-        
-        # 2. Entity 필터가 있으면 image/table 카테고리로 추가 검색
+        # Entity 필터가 있으면 entity 검색을 우선적으로 수행
         if entity_filter:
+            # 1. Entity 필터로 먼저 검색 (우선순위 높음)
             entity_filter_dict = general_filter_dict.copy()
             entity_filter_dict["entity"] = entity_filter
-            entity_filter_dict["categories"] = ["image", "table"]  # image/table만
+            # Entity가 있을 수 있는 모든 카테고리 포함 (image/table + 똑딱이가 있는 text 카테고리)
+            entity_filter_dict["categories"] = ["figure", "table", "paragraph", "heading1", "heading2", "heading3"]
             
             entity_search_filter = MVPSearchFilter(**entity_filter_dict)
             
@@ -177,11 +162,46 @@ Examples:
                 query=query,
                 filter=entity_search_filter,
                 language=language,
-                top_k=top_k // 2  # 절반만 추가 검색
+                top_k=top_k  # 전체 top_k 사용 (우선순위)
             )
             
-            # Entity 검색 결과 추가 (중복 제거)
+            # Entity 검색 결과를 먼저 추가
             for result in entity_results:
+                doc_id = result.get("id")
+                if doc_id and doc_id not in seen_ids:
+                    seen_ids.add(doc_id)
+                    all_documents.append(self._convert_to_document(result))
+            
+            # 2. 일반 필터로 보충 검색 (Entity 없이) - 부족한 경우에만
+            if len(all_documents) < top_k:
+                general_filter = MVPSearchFilter(**general_filter_dict) if general_filter_dict else MVPSearchFilter()
+                
+                general_results = self.hybrid_search.search(
+                    query=query,
+                    filter=general_filter,
+                    language=language,
+                    top_k=top_k - len(all_documents)  # 부족한 만큼만
+                )
+                
+                # 일반 검색 결과 추가 (중복 제거)
+                for result in general_results:
+                    doc_id = result.get("id")
+                    if doc_id and doc_id not in seen_ids:
+                        seen_ids.add(doc_id)
+                        all_documents.append(self._convert_to_document(result))
+        else:
+            # Entity 필터가 없으면 일반 검색만 수행
+            general_filter = MVPSearchFilter(**general_filter_dict) if general_filter_dict else MVPSearchFilter()
+            
+            general_results = self.hybrid_search.search(
+                query=query,
+                filter=general_filter,
+                language=language,
+                top_k=top_k
+            )
+            
+            # 결과를 Document로 변환
+            for result in general_results:
                 doc_id = result.get("id")
                 if doc_id and doc_id not in seen_ids:
                     seen_ids.add(doc_id)
@@ -588,7 +608,16 @@ Focus on documents that directly answer the query.""")
                         primary_language=variant_language_detection.language,  # 개별 감지된 언어 사용
                         top_k=self.default_top_k
                     )
-                    return result
+                    
+                    # 검색 통계 수집
+                    stats = None
+                    if hasattr(self.hybrid_search, 'last_search_stats'):
+                        stats = self.hybrid_search.last_search_stats.copy()
+                        # 언어 정보 추가 (집계에 필요)
+                        if stats:
+                            stats['detected_language'] = variant_language_detection.language
+                    
+                    return (result, stats)  # 튜플로 반환
                     
                 except Exception as e:
                     # 예외를 로깅하고 다시 발생시킴 (executor에서 처리하도록)
@@ -606,14 +635,15 @@ Focus on documents that directly answer the query.""")
             
             # ThreadPoolExecutor로 병렬 실행
             results_or_errors = []
+            all_search_stats = []  # 모든 검색 통계 수집
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(search_task, idx, query_variant) 
                           for idx, query_variant in search_tasks]
                 
                 for future in futures:
                     try:
-                        result = future.result()
-                        results_or_errors.append(result)
+                        result_tuple = future.result()
+                        results_or_errors.append(result_tuple)
                     except Exception as e:
                         results_or_errors.append(e)
             
@@ -635,8 +665,17 @@ Focus on documents that directly answer the query.""")
                     
                     results.append([])  # 실패한 변형은 빈 리스트
                 else:
-                    logger.debug(f"[RETRIEVAL] Task {idx} succeeded with {len(result_or_error)} documents")
-                    results.append(result_or_error)
+                    # 튜플 분해: (result, stats)
+                    if isinstance(result_or_error, tuple) and len(result_or_error) == 2:
+                        result, stats = result_or_error
+                        logger.debug(f"[RETRIEVAL] Task {idx} succeeded with {len(result)} documents")
+                        results.append(result)
+                        if stats:
+                            all_search_stats.append(stats)
+                    else:
+                        # 이전 버전 호환성 (튜플이 아닌 경우)
+                        logger.debug(f"[RETRIEVAL] Task {idx} succeeded with {len(result_or_error)} documents")
+                        results.append(result_or_error)
             
             # Connection 에러가 있으면 경고
             if connection_errors:
@@ -663,12 +702,24 @@ Focus on documents that directly answer the query.""")
                 def retry_search_task(idx: int, query_variant: str):
                     """필터 없이 재시도하는 검색"""
                     logger.debug(f"[RETRIEVAL] Retrying task {idx} without filter: '{query_variant[:50]}...'")
-                    return self._bilingual_search(
+                    result = self._bilingual_search(
                         query=query_variant,
                         filter_dict=None,  # 필터 없이
                         primary_language=language_detection.language,
                         top_k=self.default_top_k
                     )
+                    
+                    # HybridSearch의 last_search_stats 가져오기 (있는 경우)
+                    stats = None
+                    if hasattr(self.hybrid_search, 'last_search_stats'):
+                        stats = self.hybrid_search.last_search_stats.copy() if self.hybrid_search.last_search_stats else None
+                        # 언어 정보 추가 (집계에 필요)
+                        if stats:
+                            # 언어 감지
+                            variant_language_detection = detect_language(query_variant)
+                            stats['detected_language'] = variant_language_detection.language
+                    
+                    return (result, stats)  # 튜플로 반환
                 
                 logger.info(f"[RETRIEVAL] Retrying {len(search_tasks)} searches without filter...")
                 
@@ -687,19 +738,32 @@ Focus on documents that directly answer the query.""")
                 
                 # 재시도 결과 처리
                 retry_results = []
+                retry_stats = []
                 for idx, result_or_error in enumerate(retry_results_or_errors):
                     if isinstance(result_or_error, Exception):
                         logger.error(f"[RETRIEVAL] Retry task {idx} failed: {str(result_or_error)}")
                         retry_results.append([])
                     else:
-                        logger.debug(f"[RETRIEVAL] Retry task {idx} succeeded with {len(result_or_error)} documents")
-                        retry_results.append(result_or_error)
+                        # 튜플 처리: (result, stats)
+                        if isinstance(result_or_error, tuple) and len(result_or_error) == 2:
+                            result, stats = result_or_error
+                            logger.debug(f"[RETRIEVAL] Retry task {idx} succeeded with {len(result)} documents")
+                            retry_results.append(result)
+                            if stats:
+                                retry_stats.append(stats)
+                        else:
+                            # 이전 버전 호환성 (튜플이 아닌 경우)
+                            logger.debug(f"[RETRIEVAL] Retry task {idx} succeeded with {len(result_or_error)} documents")
+                            retry_results.append(result_or_error)
                 
                 # 재시도 성공 여부 로깅
                 retry_total_docs = sum(len(r) for r in retry_results if r)
                 if retry_total_docs > 0:
                     logger.info(f"[RETRIEVAL] Retry without filter succeeded: {retry_total_docs} documents found")
                     results = retry_results  # 재시도 결과 사용
+                    # 재시도 통계로 교체
+                    if retry_stats:
+                        all_search_stats = retry_stats
                     # 메타데이터에 재시도 정보 추가
                     if 'metadata' not in state:
                         state['metadata'] = {}
@@ -815,6 +879,32 @@ Focus on documents that directly answer the query.""")
             else:
                 metadata["retrieval"]["reranking_applied"] = False
             
+            # 언어별 키워드 집계
+            korean_keywords = set()
+            english_keywords = set()
+            total_keyword_docs = 0
+            total_semantic_docs = 0
+            
+            for stats in all_search_stats:
+                if stats:
+                    # 언어별 키워드 수집
+                    detected_lang = stats.get('detected_language', stats.get('language', ''))
+                    keywords = stats.get('extracted_keywords', [])
+                    
+                    if detected_lang == 'korean':
+                        korean_keywords.update(keywords)
+                    elif detected_lang == 'english':
+                        english_keywords.update(keywords)
+                    
+                    # 검색 결과 수 집계
+                    total_keyword_docs += stats.get('keyword_count', 0)
+                    total_semantic_docs += stats.get('semantic_count', 0)
+            
+            # 통계 로깅
+            if korean_keywords or english_keywords:
+                logger.info(f"[RETRIEVAL] Aggregated keywords - Korean: {list(korean_keywords)[:5]}, English: {list(english_keywords)[:5]}")
+                logger.info(f"[RETRIEVAL] Total search results - Keyword: {total_keyword_docs}, Semantic: {total_semantic_docs}")
+            
             # 메시지 생성 - 검색 과정 상세 정보
             messages = []
             
@@ -830,6 +920,36 @@ Focus on documents that directly answer the query.""")
                     AIMessage(content=f"🔎 검색 중: {query[:80]}...")
                 )
             
+            # 언어별 키워드 표시 (집계된 통계 사용)
+            if korean_keywords:
+                korean_kw_list = list(korean_keywords)[:4]
+                korean_display = ', '.join(korean_kw_list)
+                if len(korean_keywords) > 4:
+                    korean_display += f" 외 {len(korean_keywords)-4}개"
+                messages.append(
+                    AIMessage(content=f"🔑 한국어: {korean_display}")
+                )
+            
+            if english_keywords:
+                english_kw_list = list(english_keywords)[:4]
+                english_display = ', '.join(english_kw_list)
+                if len(english_keywords) > 4:
+                    english_display += f" 외 {len(english_keywords)-4}개"
+                messages.append(
+                    AIMessage(content=f"🔑 영어: {english_display}")
+                )
+            
+            # 검색 결과 통계 표시
+            if len(all_search_stats) > 0:
+                if total_keyword_docs > 0:
+                    messages.append(
+                        AIMessage(content=f"🔍 {len(all_search_stats)}개 변형 검색 (키워드 {total_keyword_docs}개 + 의미 {total_semantic_docs}개 문서)")
+                    )
+                elif total_semantic_docs > 0:
+                    messages.append(
+                        AIMessage(content=f"🔍 {len(all_search_stats)}개 변형 검색 (키워드 매칭 없음, 의미 검색 {total_semantic_docs}개)")
+                    )
+            
             # 언어 감지, 쿼리 변형, 검색 전략 메시지 제거
             # 필터 정보는 중요한 경우만 표시
             if filter_dict:
@@ -844,7 +964,7 @@ Focus on documents that directly answer the query.""")
                         AIMessage(content=f"🔍 필터: {', '.join(important_filters)}")
                     )
             
-            # 2. 검색 결과 (관련도 버그 수정)
+            # 2. 검색 결과 표시
             if documents:
                 unique_count = metadata.get("unique_documents", len(documents))
                 # 통합 score 필드 사용 - None 안전 처리
@@ -854,11 +974,11 @@ Focus on documents that directly answer the query.""")
                 if valid_scores:
                     avg_score = sum(valid_scores) / len(valid_scores)
                     messages.append(
-                        AIMessage(content=f"📄 {unique_count}개 관련 문서 발견 (평균 유사도: {avg_score:.1%})")
+                        AIMessage(content=f"📄 {unique_count}개 고유 문서 발견 (유사도 평균 {avg_score:.1%})")
                     )
                 else:
                     messages.append(
-                        AIMessage(content=f"📄 {unique_count}개 관련 문서 발견")
+                        AIMessage(content=f"📄 {unique_count}개 고유 문서 발견")
                     )
             else:
                 messages.append(

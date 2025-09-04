@@ -349,7 +349,7 @@ Identify strengths, weaknesses, and specific improvements needed.""")
                     # 부분 답변 제공
                     if state.get("final_answer"):
                         messages.append(
-                            AIMessage(content=f"📝 부분 답변:\n{state['final_answer']}\n\n⚠️ 참고: 이 답변은 품질 기준을 완전히 충족하지 못했습니다. 다음 이유로 제한적일 수 있습니다:\n- 완전성: {grade_result.completeness_score:.0%} (부족한 부분: {', '.join(missing_aspects[:3]) if missing_aspects else '없음'})\n- 관련성: {grade_result.relevance_score:.0%}\n- 명확성: {grade_result.clarity_score:.0%}")
+                            AIMessage(content=f"📝 부분 답변:\n{state['final_answer']}\n\n⚠️ 참고: 이 답변은 품질 기준을 완전히 충족하지 못했습니다. 다음 이유로 제한적일 수 있습니다:\n- 완전성: {grade_result.completeness_score:.0%} (부족한 부분: {', '.join(grade_result.missing_aspects[:3]) if grade_result.missing_aspects else '없음'})\n- 관련성: {grade_result.relevance_score:.0%}\n- 명확성: {grade_result.clarity_score:.0%}")
                         )
             
             return {

@@ -76,7 +76,7 @@ from workflow.nodes.retrieval import RetrievalNode
 from workflow.nodes.synthesis import SynthesisNode
 from workflow.nodes.hallucination import HallucinationCheckNode
 from workflow.nodes.answer_grader import AnswerGraderNode
-from workflow.tools.tavily_search import TavilySearchTool
+from workflow.tools import create_search_tool
 
 # 새로운 노드들 import (Query Routing 활성화시)
 try:
@@ -119,12 +119,22 @@ class MVPWorkflowGraph:
         self.hallucination_check = HallucinationCheckNode()
         self.answer_grader = AnswerGraderNode()
         
-        # Tavily 도구 초기화 (선택적)
+        # 웹 검색 도구 초기화 (선택적 - Google 또는 Tavily)
         try:
-            self.tavily_tool = TavilySearchTool(max_results=3)
-            self.use_tavily = True
-        except ValueError:
-            print("Warning: Tavily API key not found. Web search disabled.")
+            # Factory 패턴으로 검색 도구 생성 (Google 또는 Tavily)
+            search_tool = create_search_tool(max_results=3)
+            if search_tool is not None:
+                self.tavily_tool = search_tool  # 변수명은 유지 (호환성)
+                self.use_tavily = True
+                # 로그에 어떤 도구가 사용되는지 표시
+                tool_name = "Google" if os.getenv("USE_GOOGLE_SEARCH", "false").lower() == "true" else "Tavily"
+                logger.info(f"Web search enabled using {tool_name} Search Tool")
+            else:
+                logger.warning("No web search tool available (both Google and Tavily failed)")
+                self.tavily_tool = None
+                self.use_tavily = False
+        except Exception as e:
+            logger.warning(f"Web search tool initialization failed: {e}")
             self.tavily_tool = None
             self.use_tavily = False
         

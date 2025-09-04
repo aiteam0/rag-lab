@@ -3,7 +3,6 @@ Database Setup Script for MVP RAG System
 초기 데이터베이스 설정 및 테이블 생성
 """
 
-import asyncio
 import os
 import sys
 from pathlib import Path
@@ -18,7 +17,7 @@ from ingest.database import DatabaseManager
 load_dotenv()
 
 
-async def setup_database():
+def setup_database():
     """MVP 데이터베이스 초기화"""
     
     print("=" * 60)
@@ -31,16 +30,16 @@ async def setup_database():
     try:
         # 연결 풀 초기화
         print("\n📌 Initializing database connection...")
-        await db_manager.initialize()
+        db_manager.initialize()
         print("✅ Connection pool created")
         
         # 데이터베이스 스키마 설정
         print("\n📌 Setting up database schema...")
-        await db_manager.setup_database()
+        db_manager.setup_database()
         
         # 테이블 통계 조회
         print("\n📊 Database Statistics:")
-        stats = await db_manager.get_table_stats()
+        stats = db_manager.get_table_stats()
         print(f"  - Total Documents: {stats['total_documents']}")
         print(f"  - Categories: {len(stats['categories'])} types")
         print(f"  - Sources: {len(stats['sources'])} files")
@@ -53,7 +52,7 @@ async def setup_database():
             print(f"\n⚠️  Table contains {stats['total_documents']} documents")
             response = input("Clear existing data? (y/N): ")
             if response.lower() == 'y':
-                await db_manager.clear_table()
+                db_manager.clear_table()
                 print("✅ Table data cleared")
         
         print("\n✅ Database setup completed successfully!")
@@ -64,11 +63,11 @@ async def setup_database():
     
     finally:
         # 연결 종료
-        await db_manager.close()
+        db_manager.close()
         print("\n📌 Database connection closed")
 
 
-async def test_connection():
+def test_connection():
     """데이터베이스 연결 테스트"""
     
     print("\n" + "=" * 60)
@@ -78,25 +77,28 @@ async def test_connection():
     db_manager = DatabaseManager()
     
     try:
-        await db_manager.initialize()
+        db_manager.initialize()
         
         # 간단한 쿼리 실행
-        async with db_manager.pool.acquire() as conn:
-            version = await conn.fetchval("SELECT version()")
-            print(f"\n✅ PostgreSQL Version: {version}")
-            
-            # pgvector 확장 확인
-            extensions = await conn.fetch("""
-                SELECT extname, extversion 
-                FROM pg_extension 
-                WHERE extname = 'vector'
-            """)
-            
-            if extensions:
-                for ext in extensions:
-                    print(f"✅ Extension '{ext['extname']}' version {ext['extversion']} is installed")
-            else:
-                print("⚠️  pgvector extension not found")
+        with db_manager.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                version = cur.fetchone()[0]
+                print(f"\n✅ PostgreSQL Version: {version}")
+                
+                # pgvector 확장 확인
+                cur.execute("""
+                    SELECT extname, extversion 
+                    FROM pg_extension 
+                    WHERE extname = 'vector'
+                """)
+                extensions = cur.fetchall()
+                
+                if extensions:
+                    for ext in extensions:
+                        print(f"✅ Extension '{ext[0]}' version {ext[1]} is installed")
+                else:
+                    print("⚠️  pgvector extension not found")
         
         print("\n✅ Connection test successful!")
         
@@ -105,7 +107,7 @@ async def test_connection():
         raise
     
     finally:
-        await db_manager.close()
+        db_manager.close()
 
 
 def main():
@@ -121,9 +123,9 @@ def main():
     choice = input("\nSelect option (1-3): ")
     
     if choice == "1":
-        asyncio.run(setup_database())
+        setup_database()
     elif choice == "2":
-        asyncio.run(test_connection())
+        test_connection()
     elif choice == "3":
         print("Exiting...")
     else:

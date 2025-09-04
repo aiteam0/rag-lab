@@ -33,6 +33,9 @@ class HybridSearch:
         # spaCy 모델은 lazy loading으로 처리 (비동기 컨텍스트에서 blocking call 방지)
         self.nlp = None
         self._nlp_loading_attempted = False
+        
+        # 마지막 검색 통계 저장
+        self.last_search_stats = {}
             
         self.k = int(os.getenv("SEARCH_RRF_K", "60"))  # RRF 파라미터
         self.embeddings = DualLanguageEmbeddings()
@@ -170,6 +173,12 @@ class HybridSearch:
         if keyword_weight is None:
             keyword_weight = float(os.getenv("SEARCH_DEFAULT_KEYWORD_WEIGHT", "0.5"))
         
+        # 키워드 추출 (통계용)
+        if language == 'korean':
+            extracted_keywords = self._extract_korean_keywords(query)
+        else:
+            extracted_keywords = self._extract_english_keywords(query)
+        
         # ThreadPoolExecutor를 사용한 병렬 검색 실행
         with ThreadPoolExecutor(max_workers=2) as executor:
             semantic_future = executor.submit(
@@ -191,6 +200,15 @@ class HybridSearch:
             semantic_weight,
             keyword_weight
         )
+        
+        # 검색 통계 저장
+        self.last_search_stats = {
+            "extracted_keywords": extracted_keywords,
+            "keyword_count": len(keyword_results),
+            "semantic_count": len(semantic_results),
+            "total_merged": len(merged_results),
+            "language": language
+        }
         
         return merged_results
     
